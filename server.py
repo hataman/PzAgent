@@ -50,7 +50,7 @@ def first_command_after(command_id):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "PzADA/0.3"
+    server_version = "PzADA/0.4"
 
     def send_json(self, status, payload):
         body = json_bytes(payload)
@@ -110,7 +110,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "service": "PzADA relay",
-                    "version": 3,
+                    "version": 4,
                     "endpoints": ["/health", "/state", "/command"],
                 },
             )
@@ -127,7 +127,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "service": "PzADA relay",
-                    "version": 3,
+                    "version": 4,
                     "has_state": has_state,
                     "received_at": received_at,
                     "commands_buffered": command_count,
@@ -266,13 +266,13 @@ class Handler(BaseHTTPRequestHandler):
 
             action = payload.get("action")
 
-            if action not in {"ping", "walk", "chat"}:
+            if action not in {"ping", "walk", "chat", "open_door", "loot_item", "equip", "eat"}:
                 self.send_json(
                     400,
                     {
                         "ok": False,
                         "error": "unsupported_action",
-                        "allowed": ["ping", "walk", "chat"],
+                        "allowed": ["ping", "walk", "chat", "open_door", "loot_item", "equip", "eat"],
                     },
                 )
                 return
@@ -335,6 +335,74 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 command["text"] = text
+
+            if action == "open_door":
+                ref = payload.get("ref")
+                if not isinstance(ref, str) or not ref.startswith("door_"):
+                    self.send_json(
+                        400,
+                        {"ok": False, "error": "open_door_requires_ref"},
+                    )
+                    return
+                command["ref"] = ref
+
+            if action == "loot_item":
+                container_ref = payload.get("container_ref")
+                item_ref = payload.get("item_ref")
+                if (
+                    not isinstance(container_ref, str)
+                    or not container_ref.startswith("container_")
+                    or not isinstance(item_ref, str)
+                    or not item_ref.startswith("item_")
+                ):
+                    self.send_json(
+                        400,
+                        {
+                            "ok": False,
+                            "error": "loot_item_requires_container_ref_and_item_ref",
+                        },
+                    )
+                    return
+                command["container_ref"] = container_ref
+                command["item_ref"] = item_ref
+
+            if action == "equip":
+                item_ref = payload.get("item_ref")
+                if not isinstance(item_ref, str) or not item_ref.startswith("item_"):
+                    self.send_json(
+                        400,
+                        {"ok": False, "error": "equip_requires_item_ref"},
+                    )
+                    return
+                command["item_ref"] = item_ref
+
+            if action == "eat":
+                item_ref = payload.get("item_ref")
+                if not isinstance(item_ref, str) or not item_ref.startswith("item_"):
+                    self.send_json(
+                        400,
+                        {"ok": False, "error": "eat_requires_item_ref"},
+                    )
+                    return
+
+                try:
+                    percentage = float(payload.get("percentage", 1.0))
+                except (TypeError, ValueError):
+                    self.send_json(
+                        400,
+                        {"ok": False, "error": "eat_percentage_invalid"},
+                    )
+                    return
+
+                if percentage <= 0 or percentage > 1:
+                    self.send_json(
+                        400,
+                        {"ok": False, "error": "eat_percentage_out_of_range"},
+                    )
+                    return
+
+                command["item_ref"] = item_ref
+                command["percentage"] = percentage
 
             with _lock:
                 _commands.append(command)
