@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "10000"))
@@ -14,6 +16,8 @@ MAX_BODY = 2 * 1024 * 1024
 _lock = threading.Lock()
 _latest_state = None
 _latest_received_at = None
+_commands = []
+_last_command_id = 0
 
 
 def json_bytes(payload):
@@ -24,8 +28,28 @@ def json_bytes(payload):
     ).encode("utf-8")
 
 
+def next_command_id():
+    global _last_command_id
+
+    now = int(time.time() * 1000)
+
+    if now <= _last_command_id:
+        now = _last_command_id + 1
+
+    _last_command_id = now
+    return now
+
+
+def first_command_after(command_id):
+    for command in _commands:
+        if command["id"] > command_id:
+            return command
+
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "PzADA/0.1"
+    server_version = "PzADA/0.2"
 
     def send_json(self, status, payload):
         body = json_bytes(payload)
@@ -35,44 +59,83 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-
         self.wfile.write(body)
 
     def authorized(self):
         if not TOKEN:
+            return False
+
+        supplied = self.headers.get("X-PzADA-Token", "")
+        return hmac.compare_digest(supplied, TOKEN)
+
+    def require_auth(self):
+        if self.authorized():
             return True
 
-        return self.headers.get("X-PzADA-Token", "") == TOKEN
+        self.send_json(
+            401,
+            {
+                "ok": False,
+                "error": "unauthorized",
+            },
+        )
+        return False
+
+    def read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise ValueError("invalid_content_length")
+
+        if length <= 0:
+            raise ValueError("empty_body")
+
+        if length > MAX_BODY:
+            raise OverflowError("payload_too_large")
+
+        raw = self.rfile.read(length)
+
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise ValueError(f"invalid_json: {exc}") from exc
 
     def do_GET(self):
-        if self.path == "/":
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/":
             self.send_json(
                 200,
                 {
                     "ok": True,
                     "service": "PzADA relay",
-                    "endpoints": ["/health", "/state"],
+                    "version": 2,
+                    "endpoints": ["/health", "/state", "/command"],
                 },
             )
             return
 
-        if self.path == "/health":
+        if parsed.path == "/health":
             with _lock:
                 has_state = _latest_state is not None
                 received_at = _latest_received_at
+                command_count = len(_commands)
 
             self.send_json(
                 200,
                 {
                     "ok": True,
                     "service": "PzADA relay",
+                    "version": 2,
                     "has_state": has_state,
                     "received_at": received_at,
+                    "commands_buffered": command_count,
+                    "auth_configured": bool(TOKEN),
                 },
             )
             return
 
-        if self.path == "/state":
+        if parsed.path == "/state":
             with _lock:
                 state = _latest_state
                 received_at = _latest_received_at
@@ -97,6 +160,36 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if parsed.path == "/command":
+            if not self.require_auth():
+                return
+
+            query = parse_qs(parsed.query)
+
+            try:
+                after = int(query.get("after", ["0"])[0])
+            except ValueError:
+                self.send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "invalid_after",
+                    },
+                )
+                return
+
+            with _lock:
+                command = first_command_after(after)
+
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "command": command,
+                },
+            )
+            return
+
         self.send_json(
             404,
             {
@@ -108,83 +201,123 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         global _latest_state, _latest_received_at
 
-        if self.path != "/state":
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/state":
+            if not self.require_auth():
+                return
+
+            try:
+                payload = self.read_json_body()
+            except OverflowError as exc:
+                self.send_json(413, {"ok": False, "error": str(exc)})
+                return
+            except ValueError as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+                return
+
+            try:
+                command_after = int(
+                    self.headers.get("X-PzADA-Command-After", "0")
+                )
+            except ValueError:
+                command_after = 0
+
+            with _lock:
+                _latest_state = payload
+                _latest_received_at = time.time()
+                received_at = _latest_received_at
+                command = first_command_after(command_after)
+
             self.send_json(
-                404,
+                200,
                 {
-                    "ok": False,
-                    "error": "not_found",
+                    "ok": True,
+                    "stored": True,
+                    "received_at": received_at,
+                    "command": command,
                 },
             )
             return
 
-        if not self.authorized():
+        if parsed.path == "/command":
+            if not self.require_auth():
+                return
+
+            try:
+                payload = self.read_json_body()
+            except OverflowError as exc:
+                self.send_json(413, {"ok": False, "error": str(exc)})
+                return
+            except ValueError as exc:
+                self.send_json(400, {"ok": False, "error": str(exc)})
+                return
+
+            if not isinstance(payload, dict):
+                self.send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "command_must_be_object",
+                    },
+                )
+                return
+
+            action = payload.get("action")
+
+            if action not in {"ping", "walk"}:
+                self.send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "unsupported_action",
+                        "allowed": ["ping", "walk"],
+                    },
+                )
+                return
+
+            command = {
+                "id": next_command_id(),
+                "created_at": time.time(),
+                "action": action,
+            }
+
+            if action == "walk":
+                try:
+                    command["x"] = int(payload["x"])
+                    command["y"] = int(payload["y"])
+                    command["z"] = int(payload.get("z", 0))
+                except (KeyError, TypeError, ValueError):
+                    self.send_json(
+                        400,
+                        {
+                            "ok": False,
+                            "error": "walk_requires_integer_x_y_z",
+                        },
+                    )
+                    return
+
+            with _lock:
+                _commands.append(command)
+
+                if len(_commands) > 100:
+                    del _commands[:-100]
+
             self.send_json(
-                401,
+                200,
                 {
-                    "ok": False,
-                    "error": "unauthorized",
+                    "ok": True,
+                    "accepted": True,
+                    "command": command,
                 },
             )
             return
-
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self.send_json(
-                400,
-                {
-                    "ok": False,
-                    "error": "invalid_content_length",
-                },
-            )
-            return
-
-        if length <= 0:
-            self.send_json(
-                400,
-                {
-                    "ok": False,
-                    "error": "empty_body",
-                },
-            )
-            return
-
-        if length > MAX_BODY:
-            self.send_json(
-                413,
-                {
-                    "ok": False,
-                    "error": "payload_too_large",
-                },
-            )
-            return
-
-        try:
-            raw = self.rfile.read(length)
-            payload = json.loads(raw.decode("utf-8"))
-        except Exception as exc:
-            self.send_json(
-                400,
-                {
-                    "ok": False,
-                    "error": "invalid_json",
-                    "detail": str(exc),
-                },
-            )
-            return
-
-        with _lock:
-            _latest_state = payload
-            _latest_received_at = time.time()
-            received_at = _latest_received_at
 
         self.send_json(
-            200,
+            404,
             {
-                "ok": True,
-                "stored": True,
-                "received_at": received_at,
+                "ok": False,
+                "error": "not_found",
             },
         )
 
@@ -193,6 +326,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if not TOKEN:
+        print(
+            "[PzADA Relay] ERROR: PZADA_TOKEN environment variable is missing",
+            flush=True,
+        )
+
     print(f"[PzADA Relay] listening on {HOST}:{PORT}", flush=True)
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
