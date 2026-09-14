@@ -12,6 +12,7 @@ HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "10000"))
 TOKEN = os.environ.get("PZADA_TOKEN", "")
 MAX_BODY = 2 * 1024 * 1024
+MAX_CHAT_TEXT = 1000
 
 _lock = threading.Lock()
 _latest_state = None
@@ -49,7 +50,7 @@ def first_command_after(command_id):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "PzADA/0.2"
+    server_version = "PzADA/0.3"
 
     def send_json(self, status, payload):
         body = json_bytes(payload)
@@ -109,7 +110,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "service": "PzADA relay",
-                    "version": 2,
+                    "version": 3,
                     "endpoints": ["/health", "/state", "/command"],
                 },
             )
@@ -126,7 +127,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "service": "PzADA relay",
-                    "version": 2,
+                    "version": 3,
                     "has_state": has_state,
                     "received_at": received_at,
                     "commands_buffered": command_count,
@@ -265,13 +266,13 @@ class Handler(BaseHTTPRequestHandler):
 
             action = payload.get("action")
 
-            if action not in {"ping", "walk"}:
+            if action not in {"ping", "walk", "chat"}:
                 self.send_json(
                     400,
                     {
                         "ok": False,
                         "error": "unsupported_action",
-                        "allowed": ["ping", "walk"],
+                        "allowed": ["ping", "walk", "chat"],
                     },
                 )
                 return
@@ -296,6 +297,44 @@ class Handler(BaseHTTPRequestHandler):
                         },
                     )
                     return
+
+            if action == "chat":
+                text = payload.get("text")
+
+                if not isinstance(text, str):
+                    self.send_json(
+                        400,
+                        {
+                            "ok": False,
+                            "error": "chat_requires_text",
+                        },
+                    )
+                    return
+
+                text = text.replace("\r", " ").replace("\n", " ").strip()
+
+                if not text:
+                    self.send_json(
+                        400,
+                        {
+                            "ok": False,
+                            "error": "chat_text_empty",
+                        },
+                    )
+                    return
+
+                if len(text) > MAX_CHAT_TEXT:
+                    self.send_json(
+                        400,
+                        {
+                            "ok": False,
+                            "error": "chat_text_too_long",
+                            "max": MAX_CHAT_TEXT,
+                        },
+                    )
+                    return
+
+                command["text"] = text
 
             with _lock:
                 _commands.append(command)
