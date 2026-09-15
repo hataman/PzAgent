@@ -50,7 +50,7 @@ def first_command_after(command_id):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "PzADA/0.4"
+    server_version = "PzADA/0.5"
 
     def send_json(self, status, payload):
         body = json_bytes(payload)
@@ -110,7 +110,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "service": "PzADA relay",
-                    "version": 4,
+                    "version": 5,
                     "endpoints": ["/health", "/state", "/command"],
                 },
             )
@@ -127,7 +127,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "service": "PzADA relay",
-                    "version": 4,
+                    "version": 5,
                     "has_state": has_state,
                     "received_at": received_at,
                     "commands_buffered": command_count,
@@ -266,13 +266,13 @@ class Handler(BaseHTTPRequestHandler):
 
             action = payload.get("action")
 
-            if action not in {"ping", "walk", "chat", "open_door", "loot_item", "equip", "eat"}:
+            if action not in {"ping", "walk", "chat", "open_door", "loot_item", "equip", "eat", "attack_zombie"}:
                 self.send_json(
                     400,
                     {
                         "ok": False,
                         "error": "unsupported_action",
-                        "allowed": ["ping", "walk", "chat", "open_door", "loot_item", "equip", "eat"],
+                        "allowed": ["ping", "walk", "chat", "open_door", "loot_item", "equip", "eat", "attack_zombie"],
                     },
                 )
                 return
@@ -403,6 +403,20 @@ class Handler(BaseHTTPRequestHandler):
 
                 command["item_ref"] = item_ref
                 command["percentage"] = percentage
+
+            if action == "attack_zombie":
+                target_ref = payload.get("target_ref")
+                if (
+                    not isinstance(target_ref, str)
+                    or not target_ref.startswith("zombie_")
+                ):
+                    self.send_json(
+                        400,
+                        {"ok": False, "error": "attack_zombie_requires_target_ref"},
+                    )
+                    return
+
+                command["target_ref"] = target_ref
 
             with _lock:
                 _commands.append(command)
