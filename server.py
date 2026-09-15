@@ -80,10 +80,13 @@ ALLOWED_ACTIONS = {
     "close_window",
     "loot_item",
     "equip",
+    "wear",
+    "unwear",
     "drop_item",
     "eat",
     "drink_item",
     "drink_source",
+    "fill_water",
     "sit_ground",
     "stand_up",
     "rest",
@@ -91,6 +94,10 @@ ALLOWED_ACTIONS = {
     "bed_pose",
     "sleep",
     "wake_up",
+    "bandage",
+    "remove_bandage",
+    "disinfect",
+    "take_medicine",
     "attack_zombie",
 }
 
@@ -246,7 +253,7 @@ def build_command(payload: dict[str, Any]) -> tuple[
         command["container_ref"] = container_ref
         command["item_ref"] = item_ref
 
-    if action in {"equip", "drop_item"}:
+    if action in {"equip", "wear", "unwear", "drop_item", "take_medicine"}:
         item_ref = payload.get("item_ref")
 
         if not isinstance(item_ref, str) or not item_ref.startswith("item_"):
@@ -296,6 +303,56 @@ def build_command(payload: dict[str, Any]) -> tuple[
             }
 
         command["source_ref"] = source_ref
+
+    if action == "fill_water":
+        item_ref = payload.get("item_ref")
+        source_ref = payload.get("source_ref")
+
+        if (
+            not isinstance(item_ref, str)
+            or not item_ref.startswith("item_")
+            or not isinstance(source_ref, str)
+            or not source_ref.startswith("water_")
+        ):
+            return None, {
+                "status": 400,
+                "error": "fill_water_requires_item_ref_and_source_ref",
+            }
+
+        command["item_ref"] = item_ref
+        command["source_ref"] = source_ref
+
+    if action in {"bandage", "disinfect"}:
+        item_ref = payload.get("item_ref")
+        body_part_ref = payload.get("body_part_ref")
+
+        if (
+            not isinstance(item_ref, str)
+            or not item_ref.startswith("item_")
+            or not isinstance(body_part_ref, str)
+            or not body_part_ref.startswith("bodypart_")
+        ):
+            return None, {
+                "status": 400,
+                "error": f"{action}_requires_item_ref_and_body_part_ref",
+            }
+
+        command["item_ref"] = item_ref
+        command["body_part_ref"] = body_part_ref
+
+    if action == "remove_bandage":
+        body_part_ref = payload.get("body_part_ref")
+
+        if (
+            not isinstance(body_part_ref, str)
+            or not body_part_ref.startswith("bodypart_")
+        ):
+            return None, {
+                "status": 400,
+                "error": "remove_bandage_requires_body_part_ref",
+            }
+
+        command["body_part_ref"] = body_part_ref
 
     if action in {"rest", "get_on_bed"}:
         furniture_ref = payload.get("furniture_ref")
@@ -1070,7 +1127,7 @@ async def root_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 11,
+            "version": 12,
             "endpoints": [
                 "/health",
                 "/state",
@@ -1131,7 +1188,7 @@ async def health_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 11,
+            "version": 12,
             "has_state": state is not None,
             "received_at": received_at,
             "state_age_seconds": state_age_seconds(received_at),
@@ -1278,7 +1335,7 @@ auth_settings = AuthSettings(
 
 mcp = MCPServer(
     "PzADA",
-    version="0.2.4",
+    version="0.2.5",
     title="PzADA Project Zomboid Control",
     description=(
         "Read PzADA game telemetry and send validated actions to the "
@@ -1337,7 +1394,7 @@ def get_state(section: str = "all") -> dict[str, Any]:
     """
     Read current PzADA telemetry.
 
-    section may be: all, player, inventory, nearby, last_command.
+    section may be: all, player, inventory, body_parts, nearby, last_command.
     Use all when deciding what to do; use a smaller section for cheap checks.
     """
     state, received_at, _ = get_snapshot()
@@ -1356,6 +1413,8 @@ def get_state(section: str = "all") -> dict[str, Any]:
         data = state.get("player")
     elif section == "inventory":
         data = state.get("inventory")
+    elif section == "body_parts":
+        data = state.get("body_parts")
     elif section == "nearby":
         data = state.get("nearby")
     elif section == "last_command":
@@ -1368,6 +1427,7 @@ def get_state(section: str = "all") -> dict[str, Any]:
                 "all",
                 "player",
                 "inventory",
+                "body_parts",
                 "nearby",
                 "last_command",
             ],
@@ -1400,14 +1460,18 @@ def act(
     - open_door / close_door: {"ref": "door_..."}
     - open_window / close_window: {"ref": "window_..."}
     - loot_item: {"container_ref": "container_...", "item_ref": "item_..."}
-    - equip / drop_item: {"item_ref": "item_..."}
+    - equip / wear / unwear / drop_item: {"item_ref": "item_..."}
     - eat / drink_item: {"item_ref": "item_...", "percentage": 0..1}
     - drink_source: {"source_ref": "water_..."}
+    - fill_water: {"item_ref": "item_...", "source_ref": "water_..."}
     - sit_ground / stand_up: {}
     - rest / get_on_bed: {"furniture_ref": "furniture_..."}
     - bed_pose: {"pose": "awake" | "asleep"}
     - sleep: {} or {"furniture_ref": "furniture_..."}
     - wake_up: {}
+    - bandage / disinfect: {"item_ref": "item_...", "body_part_ref": "bodypart_..."}
+    - remove_bandage: {"body_part_ref": "bodypart_..."}
+    - take_medicine: {"item_ref": "item_..."}
     - attack_zombie: {"target_ref": "zombie_..."}
 
     Read state first and only use refs that state returned.
