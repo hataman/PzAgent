@@ -75,9 +75,22 @@ ALLOWED_ACTIONS = {
     "walk",
     "chat",
     "open_door",
+    "close_door",
+    "open_window",
+    "close_window",
     "loot_item",
     "equip",
+    "drop_item",
     "eat",
+    "drink_item",
+    "drink_source",
+    "sit_ground",
+    "stand_up",
+    "rest",
+    "get_on_bed",
+    "bed_pose",
+    "sleep",
+    "wake_up",
     "attack_zombie",
 }
 
@@ -193,13 +206,24 @@ def build_command(payload: dict[str, Any]) -> tuple[
 
         command["text"] = text
 
-    if action == "open_door":
+    if action in {"open_door", "close_door"}:
         ref = payload.get("ref")
 
         if not isinstance(ref, str) or not ref.startswith("door_"):
             return None, {
                 "status": 400,
-                "error": "open_door_requires_ref",
+                "error": f"{action}_requires_ref",
+            }
+
+        command["ref"] = ref
+
+    if action in {"open_window", "close_window"}:
+        ref = payload.get("ref")
+
+        if not isinstance(ref, str) or not ref.startswith("window_"):
+            return None, {
+                "status": 400,
+                "error": f"{action}_requires_ref",
             }
 
         command["ref"] = ref
@@ -222,24 +246,24 @@ def build_command(payload: dict[str, Any]) -> tuple[
         command["container_ref"] = container_ref
         command["item_ref"] = item_ref
 
-    if action == "equip":
+    if action in {"equip", "drop_item"}:
         item_ref = payload.get("item_ref")
 
         if not isinstance(item_ref, str) or not item_ref.startswith("item_"):
             return None, {
                 "status": 400,
-                "error": "equip_requires_item_ref",
+                "error": f"{action}_requires_item_ref",
             }
 
         command["item_ref"] = item_ref
 
-    if action == "eat":
+    if action in {"eat", "drink_item"}:
         item_ref = payload.get("item_ref")
 
         if not isinstance(item_ref, str) or not item_ref.startswith("item_"):
             return None, {
                 "status": 400,
-                "error": "eat_requires_item_ref",
+                "error": f"{action}_requires_item_ref",
             }
 
         try:
@@ -247,17 +271,79 @@ def build_command(payload: dict[str, Any]) -> tuple[
         except (TypeError, ValueError):
             return None, {
                 "status": 400,
-                "error": "eat_percentage_invalid",
+                "error": f"{action}_percentage_invalid",
             }
 
         if percentage <= 0 or percentage > 1:
             return None, {
                 "status": 400,
-                "error": "eat_percentage_out_of_range",
+                "error": f"{action}_percentage_out_of_range",
             }
 
         command["item_ref"] = item_ref
         command["percentage"] = percentage
+
+    if action == "drink_source":
+        source_ref = payload.get("source_ref")
+
+        if (
+            not isinstance(source_ref, str)
+            or not source_ref.startswith("water_")
+        ):
+            return None, {
+                "status": 400,
+                "error": "drink_source_requires_source_ref",
+            }
+
+        command["source_ref"] = source_ref
+
+    if action in {"rest", "get_on_bed"}:
+        furniture_ref = payload.get("furniture_ref")
+
+        if (
+            not isinstance(furniture_ref, str)
+            or not furniture_ref.startswith("furniture_")
+        ):
+            return None, {
+                "status": 400,
+                "error": f"{action}_requires_furniture_ref",
+            }
+
+        command["furniture_ref"] = furniture_ref
+
+    if action == "bed_pose":
+        pose = payload.get("pose")
+
+        if not isinstance(pose, str):
+            return None, {
+                "status": 400,
+                "error": "bed_pose_requires_pose",
+            }
+
+        pose = pose.strip().lower()
+
+        if pose not in {"awake", "asleep"}:
+            return None, {
+                "status": 400,
+                "error": "bed_pose_pose_must_be_awake_or_asleep",
+            }
+
+        command["pose"] = pose
+
+    if action == "sleep":
+        furniture_ref = payload.get("furniture_ref")
+
+        if furniture_ref is not None:
+            if (
+                not isinstance(furniture_ref, str)
+                or not furniture_ref.startswith("furniture_")
+            ):
+                return None, {
+                    "status": 400,
+                    "error": "sleep_furniture_ref_invalid",
+                }
+
+            command["furniture_ref"] = furniture_ref
 
     if action == "attack_zombie":
         target_ref = payload.get("target_ref")
@@ -274,7 +360,6 @@ def build_command(payload: dict[str, Any]) -> tuple[
         command["target_ref"] = target_ref
 
     return command, None
-
 
 def enqueue_command(payload: dict[str, Any]) -> tuple[
     dict[str, Any] | None,
@@ -985,7 +1070,7 @@ async def root_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 10,
+            "version": 11,
             "endpoints": [
                 "/health",
                 "/state",
@@ -1046,7 +1131,7 @@ async def health_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 10,
+            "version": 11,
             "has_state": state is not None,
             "received_at": received_at,
             "state_age_seconds": state_age_seconds(received_at),
@@ -1193,7 +1278,7 @@ auth_settings = AuthSettings(
 
 mcp = MCPServer(
     "PzADA",
-    version="0.2.3",
+    version="0.2.4",
     title="PzADA Project Zomboid Control",
     description=(
         "Read PzADA game telemetry and send validated actions to the "
@@ -1311,12 +1396,19 @@ def act(
     Current actions and args:
     - ping: {}
     - walk: {"x": int, "y": int, "z": int}
-    - open_door: {"ref": "door_..."}
+    - chat: {"text": "..."}
+    - open_door / close_door: {"ref": "door_..."}
+    - open_window / close_window: {"ref": "window_..."}
     - loot_item: {"container_ref": "container_...", "item_ref": "item_..."}
-    - equip: {"item_ref": "item_..."}
-    - eat: {"item_ref": "item_...", "percentage": 0..1}
+    - equip / drop_item: {"item_ref": "item_..."}
+    - eat / drink_item: {"item_ref": "item_...", "percentage": 0..1}
+    - drink_source: {"source_ref": "water_..."}
+    - sit_ground / stand_up: {}
+    - rest / get_on_bed: {"furniture_ref": "furniture_..."}
+    - bed_pose: {"pose": "awake" | "asleep"}
+    - sleep: {} or {"furniture_ref": "furniture_..."}
+    - wake_up: {}
     - attack_zombie: {"target_ref": "zombie_..."}
-    - chat: {"text": "..."} (parked in solo; intended for MP later)
 
     Read state first and only use refs that state returned.
     """
