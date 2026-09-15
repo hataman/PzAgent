@@ -985,13 +985,56 @@ async def root_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 8,
+            "version": 9,
             "endpoints": [
                 "/health",
                 "/state",
                 "/command",
                 "/mcp",
             ],
+        }
+    )
+
+
+async def oauth_metadata_http(request: Request) -> JSONResponse:
+    """
+    Explicit RFC 8414 metadata for ChatGPT OAuth validation.
+
+    The MCP SDK also exposes authorization-server metadata internally, but
+    ChatGPT requires PKCE S256 to be advertised unambiguously. Keeping this
+    route at the outer Starlette layer guarantees the exact document returned
+    at /.well-known/oauth-authorization-server.
+    """
+    return JSONResponse(
+        {
+            "issuer": PUBLIC_BASE_URL,
+            "authorization_endpoint": f"{PUBLIC_BASE_URL}/authorize",
+            "token_endpoint": f"{PUBLIC_BASE_URL}/token",
+            "scopes_supported": OAUTH_SCOPES,
+            "response_types_supported": ["code"],
+            "grant_types_supported": [
+                "authorization_code",
+                "refresh_token",
+            ],
+            "token_endpoint_auth_methods_supported": [
+                "client_secret_basic",
+                "client_secret_post",
+            ],
+            "code_challenge_methods_supported": ["S256"],
+        }
+    )
+
+
+async def protected_resource_metadata_http(
+    request: Request,
+) -> JSONResponse:
+    """Explicit RFC 9728 protected-resource metadata for /mcp."""
+    return JSONResponse(
+        {
+            "resource": RESOURCE_URL,
+            "authorization_servers": [PUBLIC_BASE_URL],
+            "scopes_supported": ["pzada"],
+            "bearer_methods_supported": ["header"],
         }
     )
 
@@ -1003,7 +1046,7 @@ async def health_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 8,
+            "version": 9,
             "has_state": state is not None,
             "received_at": received_at,
             "state_age_seconds": state_age_seconds(received_at),
@@ -1150,7 +1193,7 @@ auth_settings = AuthSettings(
 
 mcp = MCPServer(
     "PzADA",
-    version="0.2.1",
+    version="0.2.2",
     title="PzADA Project Zomboid Control",
     description=(
         "Read PzADA game telemetry and send validated actions to the "
@@ -1396,10 +1439,22 @@ async def lifespan(app: Starlette):
 app = Starlette(
     routes=[
         Route("/", root_http, methods=["GET"]),
+        Route(
+            "/.well-known/oauth-authorization-server",
+            oauth_metadata_http,
+            methods=["GET"],
+        ),
+        Route(
+            "/.well-known/oauth-protected-resource/mcp",
+            protected_resource_metadata_http,
+            methods=["GET"],
+        ),
         Route("/health", health_http, methods=["GET"]),
         Route("/state", state_http, methods=["GET", "POST"]),
         Route("/command", command_http, methods=["GET", "POST"]),
-        # Keep this mount LAST. Its internal Streamable HTTP endpoint is /mcp.
+        # Keep this mount LAST. Its internal Streamable HTTP endpoint is /mcp,
+        # plus /authorize and /token. The explicit .well-known routes above
+        # intentionally take precedence for ChatGPT discovery/validation.
         Mount("/", app=mcp_http_app),
     ],
     lifespan=lifespan,
