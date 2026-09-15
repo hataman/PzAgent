@@ -1150,7 +1150,7 @@ auth_settings = AuthSettings(
 
 mcp = MCPServer(
     "PzADA",
-    version="0.2.0",
+    version="0.2.1",
     title="PzADA Project Zomboid Control",
     description=(
         "Read PzADA game telemetry and send validated actions to the "
@@ -1373,16 +1373,17 @@ transport_security = TransportSecuritySettings(
     enable_dns_rebinding_protection=False
 )
 
+# Register the human approval/login endpoint through MCPServer's public
+# custom_route API. MCPServer.streamable_http_app() automatically includes
+# registered custom routes alongside /authorize, /token and /mcp.
+mcp.custom_route(
+    "/oauth/approve",
+    methods=["GET", "POST"],
+)(oauth_approve)
+
 mcp_http_app = mcp.streamable_http_app(
     stateless_http=True,
     transport_security=transport_security,
-    custom_starlette_routes=[
-        Route(
-            "/oauth/approve",
-            oauth_approve,
-            methods=["GET", "POST"],
-        ),
-    ],
 )
 
 
