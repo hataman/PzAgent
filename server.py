@@ -1,26 +1,70 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import hmac
+import html
 import json
 import os
+import secrets
 import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import parse_qs, urlencode
 
 import uvicorn
+from pydantic import AnyHttpUrl, AnyUrl
 from mcp.server import MCPServer
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    AuthorizeError,
+    OAuthAuthorizationServerProvider,
+    RefreshToken,
+    TokenError,
+    construct_redirect_uri,
+)
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Mount, Route
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "10000"))
 TOKEN = os.environ.get("PZADA_TOKEN", "")
+
+PUBLIC_BASE_URL = os.environ.get(
+    "PZADA_PUBLIC_BASE_URL",
+    "https://pzagent.onrender.com",
+).rstrip("/")
+RESOURCE_URL = f"{PUBLIC_BASE_URL}/mcp"
+
+OAUTH_CLIENT_ID = os.environ.get("PZADA_OAUTH_CLIENT_ID", "")
+OAUTH_CLIENT_SECRET = os.environ.get("PZADA_OAUTH_CLIENT_SECRET", "")
+OAUTH_PASSWORD = os.environ.get("PZADA_OAUTH_PASSWORD", "")
+OAUTH_REDIRECT_URI = os.environ.get("PZADA_OAUTH_REDIRECT_URI", "")
+
+OAUTH_SCOPES = ["pzada", "offline_access"]
+ACCESS_TOKEN_SECONDS = 3600
+REFRESH_TOKEN_SECONDS = 90 * 24 * 3600
+AUTH_CODE_SECONDS = 300
+AUTH_REQUEST_SECONDS = 600
+
+OAUTH_CONFIGURED = all(
+    [
+        OAUTH_CLIENT_ID,
+        OAUTH_CLIENT_SECRET,
+        OAUTH_PASSWORD,
+        OAUTH_REDIRECT_URI,
+    ]
+)
 
 MAX_BODY = 2 * 1024 * 1024
 MAX_CHAT_TEXT = 1000
@@ -321,6 +365,617 @@ def unauthorized_response() -> JSONResponse:
     )
 
 
+
+# ---------------------------------------------------------------------------
+# OAuth 2.1 authorization server for the ChatGPT MCP connection
+# ---------------------------------------------------------------------------
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(text: str) -> bytes:
+    padding = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text + padding)
+
+
+def _oauth_signing_key() -> bytes:
+    if not OAUTH_CLIENT_SECRET:
+        raise RuntimeError("OAuth client secret is not configured")
+
+    return hashlib.sha256(
+        (OAUTH_CLIENT_SECRET + "|PzADA-OAuth-v1").encode("utf-8")
+    ).digest()
+
+
+def _token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _encode_signed(kind: str, payload: dict[str, Any]) -> str:
+    envelope = {
+        "kind": kind,
+        "iat": int(time.time()),
+        **payload,
+    }
+
+    body = _b64url_encode(
+        json.dumps(
+            envelope,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+
+    signature = hmac.new(
+        _oauth_signing_key(),
+        body.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+
+    return body + "." + _b64url_encode(signature)
+
+
+def _decode_signed(
+    token: str,
+    expected_kind: str,
+) -> dict[str, Any] | None:
+    try:
+        body, supplied_signature = token.split(".", 1)
+
+        expected_signature = hmac.new(
+            _oauth_signing_key(),
+            body.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+
+        actual_signature = _b64url_decode(supplied_signature)
+
+        if not hmac.compare_digest(expected_signature, actual_signature):
+            return None
+
+        payload = json.loads(_b64url_decode(body).decode("utf-8"))
+
+        if payload.get("kind") != expected_kind:
+            return None
+
+        expires_at = int(payload.get("exp", 0))
+
+        if expires_at <= int(time.time()):
+            return None
+
+        return payload
+
+    except Exception:
+        return None
+
+
+class PzADAOAuthProvider(
+    OAuthAuthorizationServerProvider[
+        AuthorizationCode,
+        RefreshToken,
+        AccessToken,
+    ]
+):
+    def __init__(self) -> None:
+        self.revoked: set[str] = set()
+        self.used_codes: set[str] = set()
+
+    def client(self) -> OAuthClientInformationFull | None:
+        if not OAUTH_CONFIGURED:
+            return None
+
+        return OAuthClientInformationFull(
+            client_id=OAUTH_CLIENT_ID,
+            client_secret=OAUTH_CLIENT_SECRET,
+            redirect_uris=[AnyUrl(OAUTH_REDIRECT_URI)],
+            token_endpoint_auth_method="client_secret_basic",
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            scope=" ".join(OAUTH_SCOPES),
+            client_name="ChatGPT PzADA",
+            application_type="web",
+        )
+
+    async def get_client(
+        self,
+        client_id: str,
+    ) -> OAuthClientInformationFull | None:
+        client = self.client()
+
+        if client is None:
+            return None
+
+        if not hmac.compare_digest(client_id, OAUTH_CLIENT_ID):
+            return None
+
+        return client
+
+    async def register_client(
+        self,
+        client_info: OAuthClientInformationFull,
+    ) -> None:
+        raise NotImplementedError("Dynamic client registration is disabled")
+
+    async def authorize(
+        self,
+        client: OAuthClientInformationFull,
+        params: AuthorizationParams,
+    ) -> str:
+        if not OAUTH_CONFIGURED:
+            raise AuthorizeError(
+                error="temporarily_unavailable",
+                error_description="PzADA OAuth is not configured",
+            )
+
+        if client.client_id != OAUTH_CLIENT_ID:
+            raise AuthorizeError(
+                error="unauthorized_client",
+                error_description="Unknown OAuth client",
+            )
+
+        resource = params.resource or RESOURCE_URL
+
+        if resource != RESOURCE_URL:
+            raise AuthorizeError(
+                error="invalid_target",
+                error_description="Unexpected OAuth resource",
+            )
+
+        scopes = params.scopes or list(OAUTH_SCOPES)
+
+        if "pzada" not in scopes:
+            raise AuthorizeError(
+                error="invalid_scope",
+                error_description="pzada scope is required",
+            )
+
+        for scope in scopes:
+            if scope not in OAUTH_SCOPES:
+                raise AuthorizeError(
+                    error="invalid_scope",
+                    error_description=f"Unsupported scope: {scope}",
+                )
+
+        request_token = _encode_signed(
+            "auth_request",
+            {
+                "exp": int(time.time()) + AUTH_REQUEST_SECONDS,
+                "jti": secrets.token_urlsafe(16),
+                "client_id": client.client_id,
+                "state": params.state,
+                "scopes": scopes,
+                "code_challenge": params.code_challenge,
+                "redirect_uri": str(params.redirect_uri),
+                "redirect_uri_provided_explicitly": (
+                    params.redirect_uri_provided_explicitly
+                ),
+                "resource": resource,
+            },
+        )
+
+        return (
+            f"{PUBLIC_BASE_URL}/oauth/approve?"
+            + urlencode({"request": request_token})
+        )
+
+    def _authorization_code_from_token(
+        self,
+        token: str,
+    ) -> AuthorizationCode | None:
+        if _token_fingerprint(token) in self.used_codes:
+            return None
+
+        payload = _decode_signed(token, "auth_code")
+
+        if payload is None:
+            return None
+
+        try:
+            return AuthorizationCode(
+                code=token,
+                client_id=str(payload["client_id"]),
+                scopes=list(payload["scopes"]),
+                expires_at=float(payload["exp"]),
+                code_challenge=str(payload["code_challenge"]),
+                redirect_uri=AnyUrl(str(payload["redirect_uri"])),
+                redirect_uri_provided_explicitly=bool(
+                    payload["redirect_uri_provided_explicitly"]
+                ),
+                resource=str(payload["resource"]),
+                subject="pzada-owner",
+            )
+        except Exception:
+            return None
+
+    async def load_authorization_code(
+        self,
+        client: OAuthClientInformationFull,
+        authorization_code: str,
+    ) -> AuthorizationCode | None:
+        code = self._authorization_code_from_token(authorization_code)
+
+        if code is None:
+            return None
+
+        if code.client_id != client.client_id:
+            return None
+
+        return code
+
+    def _mint_access_token(
+        self,
+        *,
+        client_id: str,
+        scopes: list[str],
+        resource: str,
+        subject: str = "pzada-owner",
+    ) -> tuple[str, AccessToken]:
+        expires_at = int(time.time()) + ACCESS_TOKEN_SECONDS
+
+        token = _encode_signed(
+            "access",
+            {
+                "exp": expires_at,
+                "jti": secrets.token_urlsafe(16),
+                "client_id": client_id,
+                "scopes": scopes,
+                "resource": resource,
+                "subject": subject,
+            },
+        )
+
+        access = AccessToken(
+            token=token,
+            client_id=client_id,
+            scopes=scopes,
+            expires_at=expires_at,
+            resource=resource,
+            subject=subject,
+            claims={"iss": PUBLIC_BASE_URL},
+        )
+
+        return token, access
+
+    def _mint_refresh_token(
+        self,
+        *,
+        client_id: str,
+        scopes: list[str],
+        resource: str,
+        subject: str = "pzada-owner",
+    ) -> tuple[str, RefreshToken]:
+        expires_at = int(time.time()) + REFRESH_TOKEN_SECONDS
+
+        token = _encode_signed(
+            "refresh",
+            {
+                "exp": expires_at,
+                "jti": secrets.token_urlsafe(16),
+                "client_id": client_id,
+                "scopes": scopes,
+                "resource": resource,
+                "subject": subject,
+            },
+        )
+
+        refresh = RefreshToken(
+            token=token,
+            client_id=client_id,
+            scopes=scopes,
+            expires_at=expires_at,
+            resource=resource,
+            subject=subject,
+        )
+
+        return token, refresh
+
+    async def exchange_authorization_code(
+        self,
+        client: OAuthClientInformationFull,
+        authorization_code: AuthorizationCode,
+    ) -> OAuthToken:
+        code_fingerprint = _token_fingerprint(authorization_code.code)
+
+        if code_fingerprint in self.used_codes:
+            raise TokenError(
+                error="invalid_grant",
+                error_description="Authorization code already used",
+            )
+
+        if authorization_code.client_id != client.client_id:
+            raise TokenError(
+                error="invalid_grant",
+                error_description="Authorization code client mismatch",
+            )
+
+        resource = authorization_code.resource or RESOURCE_URL
+
+        if resource != RESOURCE_URL:
+            raise TokenError(
+                error="invalid_target",
+                error_description="Authorization code resource mismatch",
+            )
+
+        self.used_codes.add(code_fingerprint)
+
+        scopes = list(authorization_code.scopes)
+
+        access_token, _ = self._mint_access_token(
+            client_id=client.client_id,
+            scopes=scopes,
+            resource=resource,
+        )
+
+        refresh_token = None
+
+        if "offline_access" in scopes:
+            refresh_token, _ = self._mint_refresh_token(
+                client_id=client.client_id,
+                scopes=scopes,
+                resource=resource,
+            )
+
+        return OAuthToken(
+            access_token=access_token,
+            token_type="Bearer",
+            expires_in=ACCESS_TOKEN_SECONDS,
+            scope=" ".join(scopes),
+            refresh_token=refresh_token,
+        )
+
+    async def load_access_token(
+        self,
+        token: str,
+    ) -> AccessToken | None:
+        if _token_fingerprint(token) in self.revoked:
+            return None
+
+        payload = _decode_signed(token, "access")
+
+        if payload is None:
+            return None
+
+        try:
+            resource = str(payload["resource"])
+
+            if resource != RESOURCE_URL:
+                return None
+
+            return AccessToken(
+                token=token,
+                client_id=str(payload["client_id"]),
+                scopes=list(payload["scopes"]),
+                expires_at=int(payload["exp"]),
+                resource=resource,
+                subject=str(payload.get("subject") or "pzada-owner"),
+                claims={"iss": PUBLIC_BASE_URL},
+            )
+        except Exception:
+            return None
+
+    async def load_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: str,
+    ) -> RefreshToken | None:
+        if _token_fingerprint(refresh_token) in self.revoked:
+            return None
+
+        payload = _decode_signed(refresh_token, "refresh")
+
+        if payload is None:
+            return None
+
+        if str(payload.get("client_id")) != client.client_id:
+            return None
+
+        try:
+            resource = str(payload["resource"])
+
+            if resource != RESOURCE_URL:
+                return None
+
+            return RefreshToken(
+                token=refresh_token,
+                client_id=client.client_id,
+                scopes=list(payload["scopes"]),
+                expires_at=int(payload["exp"]),
+                resource=resource,
+                subject=str(payload.get("subject") or "pzada-owner"),
+            )
+        except Exception:
+            return None
+
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        requested_scopes = scopes or list(refresh_token.scopes)
+
+        if any(scope not in refresh_token.scopes for scope in requested_scopes):
+            raise TokenError(
+                error="invalid_scope",
+                error_description="Refresh request expanded the original scope",
+            )
+
+        resource = refresh_token.resource or RESOURCE_URL
+
+        if resource != RESOURCE_URL:
+            raise TokenError(
+                error="invalid_target",
+                error_description="Refresh token resource mismatch",
+            )
+
+        self.revoked.add(_token_fingerprint(refresh_token.token))
+
+        access_token, _ = self._mint_access_token(
+            client_id=client.client_id,
+            scopes=requested_scopes,
+            resource=resource,
+        )
+
+        new_refresh_token, _ = self._mint_refresh_token(
+            client_id=client.client_id,
+            scopes=requested_scopes,
+            resource=resource,
+        )
+
+        return OAuthToken(
+            access_token=access_token,
+            token_type="Bearer",
+            expires_in=ACCESS_TOKEN_SECONDS,
+            scope=" ".join(requested_scopes),
+            refresh_token=new_refresh_token,
+        )
+
+    async def revoke_token(
+        self,
+        token: AccessToken | RefreshToken,
+    ) -> None:
+        self.revoked.add(_token_fingerprint(token.token))
+
+    def complete_authorization(
+        self,
+        request_token: str,
+    ) -> str | None:
+        payload = _decode_signed(request_token, "auth_request")
+
+        if payload is None:
+            return None
+
+        if str(payload.get("client_id")) != OAUTH_CLIENT_ID:
+            return None
+
+        redirect_uri = str(payload.get("redirect_uri") or "")
+
+        if redirect_uri != OAUTH_REDIRECT_URI:
+            return None
+
+        code = _encode_signed(
+            "auth_code",
+            {
+                "exp": int(time.time()) + AUTH_CODE_SECONDS,
+                "jti": secrets.token_urlsafe(16),
+                "client_id": OAUTH_CLIENT_ID,
+                "scopes": list(payload["scopes"]),
+                "code_challenge": str(payload["code_challenge"]),
+                "redirect_uri": redirect_uri,
+                "redirect_uri_provided_explicitly": bool(
+                    payload["redirect_uri_provided_explicitly"]
+                ),
+                "resource": str(payload["resource"]),
+            },
+        )
+
+        return construct_redirect_uri(
+            redirect_uri,
+            code=code,
+            state=payload.get("state"),
+        )
+
+
+oauth_provider = PzADAOAuthProvider()
+
+
+def _oauth_login_page(
+    request_token: str,
+    error: str = "",
+) -> str:
+    escaped_request = html.escape(request_token, quote=True)
+
+    error_html = ""
+
+    if error:
+        error_html = (
+            '<div style="padding:10px;background:#ffe9e9;'
+            'border:1px solid #cc7777;border-radius:8px;margin-bottom:14px">'
+            + html.escape(error)
+            + "</div>"
+        )
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PzADA Authorization</title>
+</head>
+<body style="font-family:system-ui;margin:40px;max-width:520px">
+<h1>PzADA</h1>
+<p>Allow this ChatGPT connection to read PzADA state and run game actions.</p>
+{error_html}
+<form method="post" action="/oauth/approve">
+<input type="hidden" name="request" value="{escaped_request}">
+<label for="password">PzADA password</label><br>
+<input id="password" type="password" name="password"
+       autocomplete="current-password"
+       style="padding:9px;width:300px;margin-top:8px">
+<button type="submit" style="padding:9px 14px;margin-left:6px">Allow</button>
+</form>
+</body>
+</html>"""
+
+
+async def oauth_approve(request: Request):
+    if not OAUTH_CONFIGURED:
+        return HTMLResponse(
+            "<h1>PzADA OAuth is not configured</h1>",
+            status_code=503,
+        )
+
+    if request.method == "GET":
+        request_token = request.query_params.get("request", "")
+
+        if _decode_signed(request_token, "auth_request") is None:
+            return HTMLResponse(
+                "<h1>Invalid or expired authorization request</h1>",
+                status_code=400,
+            )
+
+        return HTMLResponse(_oauth_login_page(request_token))
+
+    body = await request.body()
+
+    if len(body) > 64 * 1024:
+        return HTMLResponse("<h1>Request too large</h1>", status_code=413)
+
+    try:
+        form = parse_qs(
+            body.decode("utf-8"),
+            keep_blank_values=True,
+        )
+        request_token = form.get("request", [""])[-1]
+        password = form.get("password", [""])[-1]
+    except Exception:
+        return HTMLResponse("<h1>Invalid form</h1>", status_code=400)
+
+    if not hmac.compare_digest(
+        password.encode("utf-8"),
+        OAUTH_PASSWORD.encode("utf-8"),
+    ):
+        return HTMLResponse(
+            _oauth_login_page(
+                request_token,
+                "Wrong password.",
+            ),
+            status_code=401,
+        )
+
+    redirect_to = oauth_provider.complete_authorization(request_token)
+
+    if redirect_to is None:
+        return HTMLResponse(
+            "<h1>Invalid or expired authorization request</h1>",
+            status_code=400,
+        )
+
+    return RedirectResponse(redirect_to, status_code=302)
+
+
 # ---------------------------------------------------------------------------
 # Existing relay HTTP API
 # ---------------------------------------------------------------------------
@@ -330,7 +985,7 @@ async def root_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 7,
+            "version": 8,
             "endpoints": [
                 "/health",
                 "/state",
@@ -348,13 +1003,14 @@ async def health_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 7,
+            "version": 8,
             "has_state": state is not None,
             "received_at": received_at,
             "state_age_seconds": state_age_seconds(received_at),
             "commands_buffered": len(commands),
             "auth_configured": bool(TOKEN),
             "mcp_endpoint": "/mcp",
+            "oauth_configured": OAUTH_CONFIGURED,
         }
     )
 
@@ -479,9 +1135,22 @@ async def command_http(request: Request) -> JSONResponse:
 # MCP tools
 # ---------------------------------------------------------------------------
 
+auth_settings = AuthSettings(
+    issuer_url=AnyHttpUrl(PUBLIC_BASE_URL),
+    resource_server_url=AnyHttpUrl(RESOURCE_URL),
+    required_scopes=["pzada"],
+    client_registration_options=ClientRegistrationOptions(
+        enabled=False,
+        valid_scopes=OAUTH_SCOPES,
+        default_scopes=OAUTH_SCOPES,
+    ),
+    validate_token_resource=True,
+)
+
+
 mcp = MCPServer(
     "PzADA",
-    version="0.1.0",
+    version="0.2.0",
     title="PzADA Project Zomboid Control",
     description=(
         "Read PzADA game telemetry and send validated actions to the "
@@ -494,6 +1163,8 @@ mcp = MCPServer(
         "for completion/failure. For tests, verify success with a fresh "
         "get_state after the result."
     ),
+    auth=auth_settings,
+    auth_server_provider=oauth_provider,
 )
 
 
@@ -705,6 +1376,13 @@ transport_security = TransportSecuritySettings(
 mcp_http_app = mcp.streamable_http_app(
     stateless_http=True,
     transport_security=transport_security,
+    custom_starlette_routes=[
+        Route(
+            "/oauth/approve",
+            oauth_approve,
+            methods=["GET", "POST"],
+        ),
+    ],
 )
 
 
@@ -734,8 +1412,16 @@ if __name__ == "__main__":
             flush=True,
         )
 
+    if not OAUTH_CONFIGURED:
+        print(
+            "[PzADA Relay] WARNING: OAuth is not fully configured. "
+            "Set PZADA_OAUTH_CLIENT_ID, PZADA_OAUTH_CLIENT_SECRET, "
+            "PZADA_OAUTH_PASSWORD and PZADA_OAUTH_REDIRECT_URI.",
+            flush=True,
+        )
+
     print(
-        f"[PzADA Relay] listening on {HOST}:{PORT} with MCP at /mcp",
+        f"[PzADA Relay] listening on {HOST}:{PORT} with OAuth MCP at /mcp",
         flush=True,
     )
 
