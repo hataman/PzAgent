@@ -12,7 +12,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, unquote, urlencode
 
 import uvicorn
 from pydantic import AnyHttpUrl, AnyUrl
@@ -985,7 +985,7 @@ async def root_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 9,
+            "version": 10,
             "endpoints": [
                 "/health",
                 "/state",
@@ -1046,7 +1046,7 @@ async def health_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 9,
+            "version": 10,
             "has_state": state is not None,
             "received_at": received_at,
             "state_age_seconds": state_age_seconds(received_at),
@@ -1193,7 +1193,7 @@ auth_settings = AuthSettings(
 
 mcp = MCPServer(
     "PzADA",
-    version="0.2.2",
+    version="0.2.3",
     title="PzADA Project Zomboid Control",
     description=(
         "Read PzADA game telemetry and send validated actions to the "
@@ -1428,6 +1428,159 @@ mcp_http_app = mcp.streamable_http_app(
     stateless_http=True,
     transport_security=transport_security,
 )
+
+
+class TokenBasicClientIdCompat:
+    """
+    Compatibility shim for MCP Python SDK 2.2.0.
+
+    Some OAuth clients correctly put confidential-client credentials only in
+    Authorization: Basic. MCP Python SDK 2.2.0's server-side token handler
+    nevertheless requires client_id to also exist in the form body.
+
+    For POST /token only, if client_id is absent from the form body but a Basic
+    Authorization header is present, copy only the client_id from that header
+    into the form body. The client secret stays exclusively in the Basic
+    header and is still verified by the SDK's normal ClientAuthenticator.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope.get("type") != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") != "/token"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        body_parts = []
+        more_body = True
+
+        while more_body:
+            message = await receive()
+
+            if message["type"] != "http.request":
+                await self.app(scope, _single_message_receive(message), send)
+                return
+
+            body_parts.append(message.get("body", b""))
+            more_body = bool(message.get("more_body", False))
+
+        body = b"".join(body_parts)
+        headers = list(scope.get("headers", []))
+        header_map = {
+            key.lower(): value
+            for key, value in headers
+        }
+
+        content_type = header_map.get(b"content-type", b"").decode(
+            "latin-1",
+            errors="ignore",
+        )
+        auth_header = header_map.get(b"authorization", b"").decode(
+            "latin-1",
+            errors="ignore",
+        )
+
+        patched_body = body
+
+        if (
+            "application/x-www-form-urlencoded" in content_type
+            and auth_header.startswith("Basic ")
+        ):
+            try:
+                form = parse_qs(
+                    body.decode("utf-8"),
+                    keep_blank_values=True,
+                )
+
+                if "client_id" not in form:
+                    encoded = auth_header[6:].strip()
+                    decoded = base64.b64decode(encoded).decode("utf-8")
+
+                    if ":" in decoded:
+                        basic_client_id, _ = decoded.split(":", 1)
+                        basic_client_id = unquote(basic_client_id)
+
+                        if basic_client_id:
+                            suffix = urlencode(
+                                {"client_id": basic_client_id}
+                            ).encode("utf-8")
+                            patched_body = (
+                                body + (b"&" if body else b"") + suffix
+                            )
+
+                            headers = [
+                                (key, value)
+                                for key, value in headers
+                                if key.lower() != b"content-length"
+                            ]
+                            headers.append(
+                                (
+                                    b"content-length",
+                                    str(len(patched_body)).encode("ascii"),
+                                )
+                            )
+                            scope = dict(scope)
+                            scope["headers"] = headers
+
+                            print(
+                                "[PzADA OAuth] /token: injected client_id "
+                                "from HTTP Basic for MCP SDK 2.2.0 compatibility",
+                                flush=True,
+                            )
+            except Exception as exc:
+                print(
+                    "[PzADA OAuth] /token compatibility shim skipped: "
+                    f"{type(exc).__name__}",
+                    flush=True,
+                )
+
+        sent = False
+
+        async def patched_receive():
+            nonlocal sent
+
+            if not sent:
+                sent = True
+                return {
+                    "type": "http.request",
+                    "body": patched_body,
+                    "more_body": False,
+                }
+
+            return {
+                "type": "http.request",
+                "body": b"",
+                "more_body": False,
+            }
+
+        await self.app(scope, patched_receive, send)
+
+
+def _single_message_receive(message):
+    sent = False
+
+    async def receive_once():
+        nonlocal sent
+
+        if not sent:
+            sent = True
+            return message
+
+        return {
+            "type": "http.request",
+            "body": b"",
+            "more_body": False,
+        }
+
+    return receive_once
+
+
+mcp_http_app = TokenBasicClientIdCompat(mcp_http_app)
 
 
 @asynccontextmanager
