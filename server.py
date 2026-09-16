@@ -99,6 +99,19 @@ ALLOWED_ACTIONS = {
     "disinfect",
     "take_medicine",
     "attack_zombie",
+    "pickup_ground_item",
+    "transfer_item",
+    "cancel_action",
+    "set_sneak",
+    "climb_window",
+    "set_curtain",
+    "set_light",
+    "read_item",
+    "set_media_device",
+    "control_media",
+    "set_appliance",
+    "control_fire_source",
+    "craft_recipe",
 }
 
 _lock = threading.Lock()
@@ -415,6 +428,273 @@ def build_command(payload: dict[str, Any]) -> tuple[
             }
 
         command["target_ref"] = target_ref
+
+    if action in {"pickup_ground_item", "read_item"}:
+        item_ref = payload.get("item_ref")
+
+        if not isinstance(item_ref, str) or not item_ref.startswith("item_"):
+            return None, {
+                "status": 400,
+                "error": f"{action}_requires_item_ref",
+            }
+
+        command["item_ref"] = item_ref
+
+    if action == "transfer_item":
+        item_ref = payload.get("item_ref")
+        destination_ref = payload.get("destination_ref")
+
+        destination_ok = (
+            isinstance(destination_ref, str)
+            and (
+                destination_ref in {"inventory", "main_inventory"}
+                or destination_ref.startswith("item_")
+                or destination_ref.startswith("container_")
+            )
+        )
+
+        if (
+            not isinstance(item_ref, str)
+            or not item_ref.startswith("item_")
+            or not destination_ok
+        ):
+            return None, {
+                "status": 400,
+                "error": "transfer_item_requires_item_ref_and_destination_ref",
+            }
+
+        command["item_ref"] = item_ref
+        command["destination_ref"] = destination_ref
+
+    if action == "set_sneak":
+        enabled = payload.get("enabled")
+
+        if not isinstance(enabled, bool):
+            return None, {
+                "status": 400,
+                "error": "set_sneak_requires_boolean_enabled",
+            }
+
+        command["enabled"] = enabled
+
+    if action == "climb_window":
+        ref = payload.get("ref")
+
+        if not isinstance(ref, str) or not ref.startswith("window_"):
+            return None, {
+                "status": 400,
+                "error": "climb_window_requires_ref",
+            }
+
+        command["ref"] = ref
+
+    if action == "set_curtain":
+        ref = payload.get("ref")
+        open_value = payload.get("open")
+
+        if (
+            not isinstance(ref, str)
+            or not ref.startswith("curtain_")
+            or not isinstance(open_value, bool)
+        ):
+            return None, {
+                "status": 400,
+                "error": "set_curtain_requires_ref_and_boolean_open",
+            }
+
+        command["ref"] = ref
+        command["open"] = open_value
+
+    if action == "set_light":
+        ref = payload.get("ref")
+        on = payload.get("on")
+
+        if (
+            not isinstance(ref, str)
+            or not ref.startswith("light_")
+            or not isinstance(on, bool)
+        ):
+            return None, {
+                "status": 400,
+                "error": "set_light_requires_ref_and_boolean_on",
+            }
+
+        command["ref"] = ref
+        command["on"] = on
+
+    if action == "set_media_device":
+        device_ref = payload.get("device_ref")
+
+        if not isinstance(device_ref, str) or not device_ref.startswith("media_"):
+            return None, {
+                "status": 400,
+                "error": "set_media_device_requires_device_ref",
+            }
+
+        command["device_ref"] = device_ref
+        supplied_setting = False
+
+        if "power" in payload:
+            power = payload.get("power")
+            if not isinstance(power, bool):
+                return None, {
+                    "status": 400,
+                    "error": "set_media_device_power_must_be_boolean",
+                }
+            command["power"] = power
+            supplied_setting = True
+
+        if "channel" in payload:
+            try:
+                channel = int(payload.get("channel"))
+            except (TypeError, ValueError):
+                return None, {
+                    "status": 400,
+                    "error": "set_media_device_channel_must_be_integer",
+                }
+            if channel < 0:
+                return None, {
+                    "status": 400,
+                    "error": "set_media_device_channel_out_of_range",
+                }
+            command["channel"] = channel
+            supplied_setting = True
+
+        if "volume" in payload:
+            try:
+                volume = float(payload.get("volume"))
+            except (TypeError, ValueError):
+                return None, {
+                    "status": 400,
+                    "error": "set_media_device_volume_must_be_number",
+                }
+            if volume < 0 or volume > 1:
+                return None, {
+                    "status": 400,
+                    "error": "set_media_device_volume_out_of_range",
+                }
+            command["volume"] = volume
+            supplied_setting = True
+
+        if not supplied_setting:
+            return None, {
+                "status": 400,
+                "error": "set_media_device_requires_power_channel_or_volume",
+            }
+
+    if action == "control_media":
+        device_ref = payload.get("device_ref")
+        operation = payload.get("operation")
+
+        if not isinstance(device_ref, str) or not device_ref.startswith("media_"):
+            return None, {
+                "status": 400,
+                "error": "control_media_requires_device_ref",
+            }
+
+        if not isinstance(operation, str):
+            return None, {
+                "status": 400,
+                "error": "control_media_requires_operation",
+            }
+
+        operation = operation.strip().lower()
+        if operation not in {"insert", "eject", "play", "stop"}:
+            return None, {
+                "status": 400,
+                "error": "control_media_operation_invalid",
+            }
+
+        command["device_ref"] = device_ref
+        command["operation"] = operation
+
+        if operation == "insert":
+            item_ref = payload.get("item_ref")
+            if not isinstance(item_ref, str) or not item_ref.startswith("item_"):
+                return None, {
+                    "status": 400,
+                    "error": "control_media_insert_requires_item_ref",
+                }
+            command["item_ref"] = item_ref
+
+    if action == "set_appliance":
+        appliance_ref = payload.get("appliance_ref") or payload.get("ref")
+        on = payload.get("on")
+
+        if (
+            not isinstance(appliance_ref, str)
+            or not appliance_ref.startswith("appliance_")
+            or not isinstance(on, bool)
+        ):
+            return None, {
+                "status": 400,
+                "error": "set_appliance_requires_appliance_ref_and_boolean_on",
+            }
+
+        command["appliance_ref"] = appliance_ref
+        command["on"] = on
+
+    if action == "control_fire_source":
+        fire_ref = payload.get("fire_ref") or payload.get("ref")
+        operation = payload.get("operation")
+
+        if not isinstance(fire_ref, str) or not fire_ref.startswith("fire_"):
+            return None, {
+                "status": 400,
+                "error": "control_fire_source_requires_fire_ref",
+            }
+
+        if not isinstance(operation, str):
+            return None, {
+                "status": 400,
+                "error": "control_fire_source_requires_operation",
+            }
+
+        operation = operation.strip().lower()
+        if operation not in {"light", "add_fuel", "extinguish"}:
+            return None, {
+                "status": 400,
+                "error": "control_fire_source_operation_invalid",
+            }
+
+        command["fire_ref"] = fire_ref
+        command["operation"] = operation
+
+        if operation == "add_fuel":
+            item_ref = payload.get("item_ref")
+            if not isinstance(item_ref, str) or not item_ref.startswith("item_"):
+                return None, {
+                    "status": 400,
+                    "error": "control_fire_source_add_fuel_requires_item_ref",
+                }
+            command["item_ref"] = item_ref
+
+        purpose = payload.get("purpose")
+        if purpose is not None:
+            if not isinstance(purpose, str):
+                return None, {
+                    "status": 400,
+                    "error": "control_fire_source_purpose_must_be_string",
+                }
+            purpose = purpose.replace("\r", " ").replace("\n", " ").strip()
+            if len(purpose) > 64:
+                return None, {
+                    "status": 400,
+                    "error": "control_fire_source_purpose_too_long",
+                }
+            if purpose:
+                command["purpose"] = purpose
+
+    if action == "craft_recipe":
+        recipe_ref = payload.get("recipe_ref") or payload.get("ref")
+
+        if not isinstance(recipe_ref, str) or not recipe_ref.startswith("craft_"):
+            return None, {
+                "status": 400,
+                "error": "craft_recipe_requires_recipe_ref",
+            }
+
+        command["recipe_ref"] = recipe_ref
 
     return command, None
 
@@ -1127,7 +1407,7 @@ async def root_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 12,
+            "version": 13,
             "endpoints": [
                 "/health",
                 "/state",
@@ -1188,7 +1468,7 @@ async def health_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 12,
+            "version": 13,
             "has_state": state is not None,
             "received_at": received_at,
             "state_age_seconds": state_age_seconds(received_at),
@@ -1335,7 +1615,7 @@ auth_settings = AuthSettings(
 
 mcp = MCPServer(
     "PzADA",
-    version="0.2.5",
+    version="0.2.6",
     title="PzADA Project Zomboid Control",
     description=(
         "Read PzADA game telemetry and send validated actions to the "
@@ -1394,7 +1674,7 @@ def get_state(section: str = "all") -> dict[str, Any]:
     """
     Read current PzADA telemetry.
 
-    section may be: all, player, inventory, body_parts, nearby, last_command.
+    section may be: all, player, inventory, body_parts, nearby, world_time, crafting, last_command.
     Use all when deciding what to do; use a smaller section for cheap checks.
     """
     state, received_at, _ = get_snapshot()
@@ -1417,6 +1697,10 @@ def get_state(section: str = "all") -> dict[str, Any]:
         data = state.get("body_parts")
     elif section == "nearby":
         data = state.get("nearby")
+    elif section == "world_time":
+        data = state.get("world_time")
+    elif section == "crafting":
+        data = state.get("crafting")
     elif section == "last_command":
         data = state.get("last_command")
     else:
@@ -1429,6 +1713,8 @@ def get_state(section: str = "all") -> dict[str, Any]:
                 "inventory",
                 "body_parts",
                 "nearby",
+                "world_time",
+                "crafting",
                 "last_command",
             ],
         }
@@ -1473,6 +1759,18 @@ def act(
     - remove_bandage: {"body_part_ref": "bodypart_..."}
     - take_medicine: {"item_ref": "item_..."}
     - attack_zombie: {"target_ref": "zombie_..."}
+    - pickup_ground_item / read_item: {"item_ref": "item_..."}
+    - transfer_item: {"item_ref": "item_...", "destination_ref": "inventory" | "main_inventory" | "item_..." | "container_..."}
+    - cancel_action: {}
+    - set_sneak: {"enabled": bool}
+    - climb_window: {"ref": "window_..."}
+    - set_curtain: {"ref": "curtain_...", "open": bool}
+    - set_light: {"ref": "light_...", "on": bool}
+    - set_media_device: {"device_ref": "media_...", optional "power": bool, "channel": int, "volume": 0..1}
+    - control_media: {"device_ref": "media_...", "operation": "insert" | "eject" | "play" | "stop", optional "item_ref": "item_..."}
+    - set_appliance: {"appliance_ref": "appliance_...", "on": bool}
+    - control_fire_source: {"fire_ref": "fire_...", "operation": "light" | "add_fuel" | "extinguish", optional "item_ref": "item_...", "purpose": "..."}
+    - craft_recipe: {"recipe_ref": "craft_..."}
 
     Read state first and only use refs that state returned.
     """
