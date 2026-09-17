@@ -1407,7 +1407,7 @@ async def root_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 13,
+            "version": 14,
             "endpoints": [
                 "/health",
                 "/state",
@@ -1468,7 +1468,7 @@ async def health_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 13,
+            "version": 14,
             "has_state": state is not None,
             "received_at": received_at,
             "state_age_seconds": state_age_seconds(received_at),
@@ -1615,7 +1615,7 @@ auth_settings = AuthSettings(
 
 mcp = MCPServer(
     "PzADA",
-    version="0.2.6",
+    version="0.2.7",
     title="PzADA Project Zomboid Control",
     description=(
         "Read PzADA game telemetry and send validated actions to the "
@@ -1666,6 +1666,283 @@ def health() -> dict[str, Any]:
     }
 
 
+def _nearby(state: dict[str, Any]) -> dict[str, Any]:
+    value = state.get("nearby")
+    return value if isinstance(value, dict) else {}
+
+
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _compact_item(item: dict[str, Any], mode: str) -> dict[str, Any]:
+    common = ("ref", "id", "type", "name")
+    food = (
+        "food", "hunger_change", "thirst_change", "rotten", "cooked", "burnt",
+    )
+    water = (
+        "fluid", "fluid_amount", "fluid_capacity", "fluid_ratio", "fluid_empty",
+        "water_source", "fluid_tainted", "fluid_tainted_known", "fluid_clean_water",
+    )
+    literature = (
+        "literature", "pages", "pages_read", "skill_trained", "skill_min_level",
+        "skill_max_level", "learned_recipes",
+    )
+
+    keys = list(common)
+    if mode == "food":
+        keys.extend(food)
+    elif mode == "water":
+        keys.extend(water)
+    elif mode == "literature":
+        keys.extend(literature)
+    else:
+        keys.extend(("food", "fluid", "literature", "weapon", "clothing"))
+
+    return {key: item.get(key) for key in keys if key in item}
+
+
+def _iter_inventory_items(items: list[Any], parent_ref: str | None = None):
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        yield raw, parent_ref
+        nested = raw.get("container_items")
+        if isinstance(nested, list):
+            yield from _iter_inventory_items(nested, raw.get("ref"))
+
+
+def _item_matches(item: dict[str, Any], mode: str) -> bool:
+    if mode == "food":
+        return item.get("food") is True
+    if mode == "water":
+        return item.get("fluid") is True or item.get("water_source") is True
+    if mode == "literature":
+        return item.get("literature") is True
+    return False
+
+
+def _filtered_item_view(state: dict[str, Any], mode: str) -> dict[str, Any]:
+    nearby = _nearby(state)
+    result: dict[str, Any] = {
+        "player": state.get("player"),
+        "inventory": [],
+        "containers": [],
+        "ground_items": [],
+    }
+
+    for item, parent_ref in _iter_inventory_items(_list(state.get("inventory"))):
+        if _item_matches(item, mode):
+            entry = _compact_item(item, mode)
+            entry["parent_container_ref"] = parent_ref
+            result["inventory"].append(entry)
+
+    for container in _list(nearby.get("containers")):
+        if not isinstance(container, dict):
+            continue
+        matches = []
+        for item in _list(container.get("items")):
+            if isinstance(item, dict) and _item_matches(item, mode):
+                matches.append(_compact_item(item, mode))
+        if matches:
+            result["containers"].append({
+                "ref": container.get("ref"),
+                "x": container.get("x"),
+                "y": container.get("y"),
+                "z": container.get("z"),
+                "type": container.get("type"),
+                "items": matches,
+            })
+
+    for ground in _list(nearby.get("ground_items")):
+        if not isinstance(ground, dict):
+            continue
+        item = ground.get("item")
+        if isinstance(item, dict) and _item_matches(item, mode):
+            result["ground_items"].append({
+                "ref": ground.get("ref"),
+                "x": ground.get("x"),
+                "y": ground.get("y"),
+                "z": ground.get("z"),
+                "item": _compact_item(item, mode),
+            })
+
+    for ground_container in _list(nearby.get("ground_containers")):
+        if not isinstance(ground_container, dict):
+            continue
+        matches = []
+        for item in _list(ground_container.get("items")):
+            if isinstance(item, dict) and _item_matches(item, mode):
+                matches.append(_compact_item(item, mode))
+        if matches:
+            result["containers"].append({
+                "ref": ground_container.get("ref"),
+                "x": ground_container.get("x"),
+                "y": ground_container.get("y"),
+                "z": ground_container.get("z"),
+                "type": ground_container.get("type"),
+                "ground_container": True,
+                "items": matches,
+            })
+
+    if mode == "water":
+        result["water_sources"] = _list(nearby.get("water_sources"))
+
+    return result
+
+
+def _container_summaries(state: dict[str, Any]) -> dict[str, Any]:
+    nearby = _nearby(state)
+
+    def compact(entry: Any, *, kind: str | None = None) -> dict[str, Any] | None:
+        if not isinstance(entry, dict):
+            return None
+        out = {
+            key: entry.get(key)
+            for key in ("ref", "x", "y", "z", "type")
+            if key in entry
+        }
+        if kind:
+            out["kind"] = kind
+        return out
+
+    containers = []
+    for entry in _list(nearby.get("containers")):
+        value = compact(entry, kind="world")
+        if value:
+            containers.append(value)
+    for entry in _list(nearby.get("ground_containers")):
+        value = compact(entry, kind="ground")
+        if value:
+            containers.append(value)
+    for entry in _list(nearby.get("corpses")):
+        value = compact(entry, kind="corpse")
+        if value:
+            containers.append(value)
+
+    vehicles = []
+    for vehicle in _list(nearby.get("vehicles")):
+        if not isinstance(vehicle, dict):
+            continue
+        vehicles.append({
+            key: vehicle.get(key)
+            for key in ("ref", "id", "x", "y", "z", "distance", "engine_running")
+            if key in vehicle
+        })
+
+    return {
+        "player": state.get("player"),
+        "containers": containers,
+        "vehicles": vehicles,
+    }
+
+
+def _interaction_view(state: dict[str, Any]) -> dict[str, Any]:
+    nearby = _nearby(state)
+    keys = (
+        "doors", "windows", "curtains", "lights", "appliances", "fire_sources",
+        "media_devices", "furniture",
+    )
+    return {
+        "player": state.get("player"),
+        **{key: _list(nearby.get(key)) for key in keys},
+    }
+
+
+def _movement_view(state: dict[str, Any]) -> dict[str, Any]:
+    nearby = _nearby(state)
+    return {
+        "player": state.get("player"),
+        "players": _list(nearby.get("players")),
+        "zombies": _list(nearby.get("zombies")),
+        "doors": _list(nearby.get("doors")),
+        "windows": _list(nearby.get("windows")),
+        "vehicles": [
+            {
+                key: vehicle.get(key)
+                for key in ("ref", "id", "x", "y", "z", "distance", "engine_running")
+                if key in vehicle
+            }
+            for vehicle in _list(nearby.get("vehicles"))
+            if isinstance(vehicle, dict)
+        ],
+        "water_sources": [
+            {
+                key: source.get(key)
+                for key in ("ref", "x", "y", "z", "kind", "tainted", "tainted_known")
+                if key in source
+            }
+            for source in _list(nearby.get("water_sources"))
+            if isinstance(source, dict)
+        ],
+        "last_command": state.get("last_command"),
+    }
+
+
+def _social_view(state: dict[str, Any]) -> dict[str, Any]:
+    nearby = _nearby(state)
+    return {
+        "player": state.get("player"),
+        "players": _list(nearby.get("players")),
+        "chat_messages": _list(state.get("chat_messages")),
+        "last_command": state.get("last_command"),
+    }
+
+
+def _ground_view(state: dict[str, Any]) -> dict[str, Any]:
+    nearby = _nearby(state)
+    ground_items = []
+    for raw in _list(nearby.get("ground_items")):
+        if not isinstance(raw, dict):
+            continue
+        item = raw.get("item") if isinstance(raw.get("item"), dict) else {}
+        ground_items.append({
+            "ref": raw.get("ref"),
+            "x": raw.get("x"),
+            "y": raw.get("y"),
+            "z": raw.get("z"),
+            "type": raw.get("type"),
+            "name": raw.get("name"),
+            "inventory_container": raw.get("inventory_container"),
+            "item": _compact_item(item, "summary") if item else None,
+        })
+    return {"player": state.get("player"), "ground_items": ground_items}
+
+
+def _find_container_detail(state: dict[str, Any], ref: str) -> tuple[dict[str, Any] | None, str | None]:
+    nearby = _nearby(state)
+    player = state.get("player") if isinstance(state.get("player"), dict) else {}
+    px, py, pz = player.get("x"), player.get("y"), player.get("z")
+
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    for key, kind in (("containers", "world"), ("ground_containers", "ground"), ("corpses", "corpse")):
+        for entry in _list(nearby.get(key)):
+            if isinstance(entry, dict):
+                candidates.append((kind, entry))
+
+    for kind, entry in candidates:
+        if entry.get("ref") != ref:
+            continue
+        if not all(isinstance(v, (int, float)) for v in (px, py, pz, entry.get("x"), entry.get("y"), entry.get("z"))):
+            return None, "position_unavailable"
+        if abs(float(entry["z"]) - float(pz)) > 0.5:
+            return None, "not_accessible"
+        dx = abs(float(entry["x"]) - float(px))
+        dy = abs(float(entry["y"]) - float(py))
+        if max(dx, dy) > 1.75:
+            return None, "out_of_interaction_range"
+        return {**entry, "kind": kind}, None
+
+    for vehicle in _list(nearby.get("vehicles")):
+        if not isinstance(vehicle, dict):
+            continue
+        for container in _list(vehicle.get("containers")):
+            if isinstance(container, dict) and container.get("ref") == ref:
+                return None, "vehicle_container_access_requires_vanilla_gate"
+
+    return None, "container_not_found"
+
+
 @mcp.tool(
     title="Read PzADA state",
     annotations=READ_ONLY,
@@ -1674,8 +1951,21 @@ def get_state(section: str = "all") -> dict[str, Any]:
     """
     Read current PzADA telemetry.
 
-    section may be: all, player, inventory, body_parts, nearby, world_time, crafting, last_command.
-    Use all when deciding what to do; use a smaller section for cheap checks.
+    Routine decisions should use the smallest useful view instead of all/nearby.
+
+    Cheap views:
+    - player, body_parts, world_time, crafting, inventory, last_command
+    - safety: player + nearby players/zombies + last command
+    - movement: player + players/zombies + doors/windows/vehicles/water
+    - social: player + nearby players + chat
+    - interactions: doors/windows/curtains/lights/appliances/fire/media/furniture
+    - containers: nearby container identities/positions only, no contents
+    - ground: lightweight visible ground items
+    - food, water, literature: only matching items and their locations
+    - container:<ref>: one physically-near world/ground/corpse container in detail
+
+    all and nearby remain available for diagnostics/backward compatibility, but
+    should not be used in the normal action loop.
     """
     state, received_at, _ = get_snapshot()
 
@@ -1685,24 +1975,53 @@ def get_state(section: str = "all") -> dict[str, Any]:
             "error": "no_state_received",
         }
 
-    section = (section or "all").strip().lower()
+    section_raw = (section or "all").strip()
+    section_key = section_raw.lower()
+    error: str | None = None
 
-    if section == "all":
+    if section_key == "all":
         data: Any = state
-    elif section == "player":
+    elif section_key == "player":
         data = state.get("player")
-    elif section == "inventory":
+    elif section_key == "inventory":
         data = state.get("inventory")
-    elif section == "body_parts":
+    elif section_key == "body_parts":
         data = state.get("body_parts")
-    elif section == "nearby":
+    elif section_key == "nearby":
         data = state.get("nearby")
-    elif section == "world_time":
+    elif section_key == "world_time":
         data = state.get("world_time")
-    elif section == "crafting":
+    elif section_key == "crafting":
         data = state.get("crafting")
-    elif section == "last_command":
+    elif section_key == "last_command":
         data = state.get("last_command")
+    elif section_key == "safety":
+        nearby = _nearby(state)
+        data = {
+            "player": state.get("player"),
+            "players": _list(nearby.get("players")),
+            "zombies": _list(nearby.get("zombies")),
+            "last_command": state.get("last_command"),
+        }
+    elif section_key == "movement":
+        data = _movement_view(state)
+    elif section_key == "social":
+        data = _social_view(state)
+    elif section_key == "interactions":
+        data = _interaction_view(state)
+    elif section_key == "containers":
+        data = _container_summaries(state)
+    elif section_key == "ground":
+        data = _ground_view(state)
+    elif section_key in {"food", "water", "literature"}:
+        data = _filtered_item_view(state, section_key)
+    elif section_key.startswith("container:"):
+        ref = section_raw.split(":", 1)[1].strip()
+        if not ref:
+            data = None
+            error = "container_ref_required"
+        else:
+            data, error = _find_container_detail(state, ref)
     else:
         return {
             "ok": False,
@@ -1716,14 +2035,33 @@ def get_state(section: str = "all") -> dict[str, Any]:
                 "world_time",
                 "crafting",
                 "last_command",
+                "safety",
+                "movement",
+                "social",
+                "interactions",
+                "containers",
+                "ground",
+                "food",
+                "water",
+                "literature",
+                "container:<ref>",
             ],
+        }
+
+    if error:
+        return {
+            "ok": False,
+            "error": error,
+            "received_at": received_at,
+            "state_age_seconds": state_age_seconds(received_at),
+            "section": section_raw,
         }
 
     return {
         "ok": True,
         "received_at": received_at,
         "state_age_seconds": state_age_seconds(received_at),
-        "section": section,
+        "section": section_raw,
         "data": data,
     }
 
