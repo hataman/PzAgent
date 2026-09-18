@@ -1742,19 +1742,22 @@ auth_settings = AuthSettings(
 
 mcp = MCPServer(
     "PzADA",
-    version="0.2.8",
+    version="0.2.9-fastloop",
     title="PzADA Project Zomboid Control",
     description=(
         "Read PzADA game telemetry and send validated actions to the "
         "Project Zomboid Ada character."
     ),
     instructions=(
-        "Always call get_state before acting. Use refs exactly as returned by "
-        "state; never invent item, door, container, or zombie refs. "
-        "After act returns a command id, call get_result with that id and wait "
-        "for completion/failure. For tests, verify success with a fresh "
-        "get_state after the result. Use observe(radius) for a one-shot, "
-        "viewport-bounded visible-world summary instead of expanding nearby."
+        "For routine live play, prefer step(action, args, state_section) so one "
+        "tool call queues the action, waits briefly for its result, and returns "
+        "a compact fresh state. Do not call get_state before and after every "
+        "routine action when step already returned usable state. Use refs exactly "
+        "as returned by telemetry; never invent item, door, container, or zombie "
+        "refs. On stopped/failed movement, immediately replan from the returned "
+        "state instead of waiting for another user turn. Use get_state for initial "
+        "sync, a different focused view, or diagnostics. all/nearby are diagnostic "
+        "only. Use observe(radius) for one-shot visible-world detail."
     ),
     auth=auth_settings,
     auth_server_provider=oauth_provider,
@@ -2072,7 +2075,7 @@ def _find_container_detail(state: dict[str, Any], ref: str) -> tuple[dict[str, A
     title="Read PzADA state",
     annotations=READ_ONLY,
 )
-def get_state(section: str = "all") -> dict[str, Any]:
+def get_state(section: str = "safety") -> dict[str, Any]:
     """
     Read current PzADA telemetry.
 
@@ -2102,7 +2105,7 @@ def get_state(section: str = "all") -> dict[str, Any]:
             "error": "no_state_received",
         }
 
-    section_raw = (section or "all").strip()
+    section_raw = (section or "safety").strip()
     section_key = section_raw.lower()
     error: str | None = None
 
@@ -2359,7 +2362,9 @@ def act(
     - control_fire_source: {"fire_ref": "fire_...", "operation": "light" | "add_fuel" | "extinguish", optional "item_ref": "item_...", "purpose": "..."}
     - craft_recipe: {"recipe_ref": "craft_..."}
 
-    Read state first and only use refs that state returned.
+    Legacy/debug action enqueue. Routine live play should use step(), which
+    returns the action result and compact fresh state in one tool call. Use only
+    refs that telemetry returned.
     """
     payload: dict[str, Any] = {"action": action}
 
@@ -2380,8 +2385,134 @@ def act(
         "ok": True,
         "accepted": True,
         "command": command,
-        "next": "Call get_result with command.id, then verify with get_state.",
+        "next": "Legacy path: call get_result. Routine live play should use step().",
     }
+
+
+@mcp.tool(
+    title="PzADA fast action step",
+    annotations=WRITE_ACTION,
+)
+async def step(
+    action: str,
+    args: dict[str, Any] | None = None,
+    state_section: str = "safety",
+    wait_seconds: float = 3.0,
+) -> dict[str, Any]:
+    """
+    Queue one action, wait briefly for its Lua result, then return a compact
+    fresh telemetry view in the same tool call. This is the preferred live-play
+    path because it avoids act -> get_result -> get_state round trips.
+
+    state_section is intentionally limited to safety or movement so the fast
+    path cannot accidentally return a large diagnostic payload. Use get_state
+    separately only when the next decision really needs another focused view.
+    """
+    state_section = str(state_section or "safety").strip().lower()
+    if state_section not in {"safety", "movement"}:
+        return {
+            "ok": False,
+            "error": "fast_step_state_section_invalid",
+            "allowed": ["safety", "movement"],
+        }
+
+    try:
+        wait_seconds = float(wait_seconds)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "invalid_wait"}
+
+    wait_seconds = max(0.0, min(wait_seconds, MAX_RESULT_WAIT_SECONDS))
+    payload: dict[str, Any] = {"action": action}
+    if args:
+        payload.update(args)
+
+    command, error = enqueue_command(payload)
+    if error:
+        return {
+            "ok": False,
+            **{k: v for k, v in error.items() if k != "status"},
+        }
+
+    assert command is not None
+    command_id = int(command["id"])
+    started = time.monotonic()
+    deadline = started + wait_seconds
+
+    while True:
+        state, received_at, commands = get_snapshot()
+        result = command_result_from_state(state, command_id)
+
+        if result is not None:
+            if state_section == "movement":
+                data = _movement_view(state or {})
+            else:
+                nearby = _nearby(state or {})
+                data = {
+                    "player": (state or {}).get("player"),
+                    "players": _list(nearby.get("players")),
+                    "zombies": _list(nearby.get("zombies")),
+                    "last_command": (state or {}).get("last_command"),
+                }
+            state_view = {
+                "ok": True,
+                "received_at": received_at,
+                "state_age_seconds": state_age_seconds(received_at),
+                "section": state_section,
+                "data": data,
+            }
+            return {
+                "ok": True,
+                "accepted": True,
+                "found": True,
+                "command": command,
+                "result": result,
+                "state": state_view,
+                "timing": {
+                    "server_wait_seconds": round(time.monotonic() - started, 3),
+                    "state_age_seconds": state_age_seconds(received_at),
+                },
+            }
+
+        if time.monotonic() >= deadline:
+            queued = next(
+                (
+                    item
+                    for item in reversed(commands)
+                    if int(item["id"]) == command_id
+                ),
+                None,
+            )
+            if state_section == "movement":
+                data = _movement_view(state or {})
+            else:
+                nearby = _nearby(state or {})
+                data = {
+                    "player": (state or {}).get("player"),
+                    "players": _list(nearby.get("players")),
+                    "zombies": _list(nearby.get("zombies")),
+                    "last_command": (state or {}).get("last_command"),
+                }
+            state_view = {
+                "ok": True,
+                "received_at": received_at,
+                "state_age_seconds": state_age_seconds(received_at),
+                "section": state_section,
+                "data": data,
+            }
+            return {
+                "ok": True,
+                "accepted": True,
+                "found": False,
+                "pending": queued is not None,
+                "command": command,
+                "state": state_view,
+                "timing": {
+                    "server_wait_seconds": round(time.monotonic() - started, 3),
+                    "state_age_seconds": state_age_seconds(received_at),
+                },
+            }
+
+        await asyncio.sleep(0.1)
 
 
 @mcp.tool(
@@ -2390,7 +2521,7 @@ def act(
 )
 async def get_result(
     command_id: int,
-    wait_seconds: float = 0.0,
+    wait_seconds: float = 3.0,
 ) -> dict[str, Any]:
     """
     Read the ACK/result for a queued PzADA command.
