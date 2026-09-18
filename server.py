@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import html
 import json
+import math
 import os
 import secrets
 import threading
@@ -69,6 +70,7 @@ OAUTH_CONFIGURED = all(
 MAX_BODY = 2 * 1024 * 1024
 MAX_CHAT_TEXT = 1000
 MAX_RESULT_WAIT_SECONDS = 15.0
+MAX_OBSERVATION_RADIUS = 1_000_000.0
 
 ALLOWED_ACTIONS = {
     "ping",
@@ -119,6 +121,9 @@ _latest_state: dict[str, Any] | None = None
 _latest_received_at: float | None = None
 _commands: list[dict[str, Any]] = []
 _last_command_id = 0
+_observations: list[dict[str, Any]] = []
+_observation_results: dict[int, dict[str, Any]] = {}
+_last_observation_id = 0
 
 
 def now_seconds() -> float:
@@ -142,6 +147,50 @@ def next_command_id() -> int:
         _last_command_id = now_id
 
     return now_id
+
+
+def first_observation_after(observation_id: int) -> dict[str, Any] | None:
+    for observation in _observations:
+        if int(observation["id"]) > observation_id:
+            return observation
+    return None
+
+
+def enqueue_observation(
+    *,
+    kind: str,
+    radius: float | None = None,
+    ref: str | None = None,
+) -> dict[str, Any]:
+    global _last_observation_id
+
+    with _lock:
+        observation_id = int(time.time() * 1000)
+        if observation_id <= _last_observation_id:
+            observation_id = _last_observation_id + 1
+        _last_observation_id = observation_id
+
+        observation: dict[str, Any] = {
+            "id": observation_id,
+            "created_at": now_seconds(),
+            "kind": kind,
+        }
+        if radius is not None:
+            observation["radius"] = float(radius)
+        if ref is not None:
+            observation["ref"] = ref
+
+        _observations.append(observation)
+        if len(_observations) > 100:
+            del _observations[:-100]
+
+    return observation
+
+
+def observation_result(observation_id: int) -> dict[str, Any] | None:
+    with _lock:
+        value = _observation_results.get(int(observation_id))
+        return dict(value) if isinstance(value, dict) else None
 
 
 def first_command_after(command_id: int) -> dict[str, Any] | None:
@@ -199,6 +248,15 @@ def build_command(payload: dict[str, Any]) -> tuple[
                 "status": 400,
                 "error": "walk_requires_integer_x_y_z",
             }
+
+        pace = str(payload.get("pace", "walk")).strip().lower()
+        if pace not in {"walk", "run"}:
+            return None, {
+                "status": 400,
+                "error": "walk_pace_invalid",
+                "allowed": ["walk", "run"],
+            }
+        command["pace"] = pace
 
     if action == "chat":
         text = payload.get("text")
@@ -429,13 +487,27 @@ def build_command(payload: dict[str, Any]) -> tuple[
 
         command["target_ref"] = target_ref
 
-    if action in {"pickup_ground_item", "read_item"}:
+    if action == "pickup_ground_item":
+        item_ref = payload.get("item_ref")
+
+        if (
+            not isinstance(item_ref, str)
+            or not item_ref.startswith(("item_", "groundcover_"))
+        ):
+            return None, {
+                "status": 400,
+                "error": "pickup_ground_item_requires_ground_ref",
+            }
+
+        command["item_ref"] = item_ref
+
+    if action == "read_item":
         item_ref = payload.get("item_ref")
 
         if not isinstance(item_ref, str) or not item_ref.startswith("item_"):
             return None, {
                 "status": 400,
-                "error": f"{action}_requires_item_ref",
+                "error": "read_item_requires_item_ref",
             }
 
         command["item_ref"] = item_ref
@@ -1407,11 +1479,12 @@ async def root_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 14,
+            "version": 16,
             "endpoints": [
                 "/health",
                 "/state",
                 "/command",
+                "/observation-result",
                 "/mcp",
             ],
         }
@@ -1468,11 +1541,13 @@ async def health_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 14,
+            "version": 16,
             "has_state": state is not None,
             "received_at": received_at,
             "state_age_seconds": state_age_seconds(received_at),
             "commands_buffered": len(commands),
+            "observations_buffered": len(_observations),
+            "observation_results": len(_observation_results),
             "auth_configured": bool(TOKEN),
             "mcp_endpoint": "/mcp",
             "oauth_configured": OAUTH_CONFIGURED,
@@ -1518,11 +1593,19 @@ async def state_post_http(request: Request) -> JSONResponse:
     except ValueError:
         command_after = 0
 
+    try:
+        observation_after = int(
+            request.headers.get("X-PzADA-Observation-After", "0")
+        )
+    except ValueError:
+        observation_after = 0
+
     with _lock:
         _latest_state = payload
         _latest_received_at = time.time()
         received_at = _latest_received_at
         command = first_command_after(command_after)
+        observation = first_observation_after(observation_after)
 
     return JSONResponse(
         {
@@ -1530,6 +1613,7 @@ async def state_post_http(request: Request) -> JSONResponse:
             "stored": True,
             "received_at": received_at,
             "command": command,
+            "observation": observation,
         }
     )
 
@@ -1584,6 +1668,49 @@ async def command_post_http(request: Request) -> JSONResponse:
     )
 
 
+async def observation_result_post_http(request: Request) -> JSONResponse:
+    if not request_authorized(request):
+        return unauthorized_response()
+
+    payload, error_response = await parse_json_request(request)
+    if error_response:
+        return error_response
+
+    assert payload is not None
+
+    try:
+        observation_id = int(payload.get("observation_id"))
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"ok": False, "error": "invalid_observation_id"},
+            status_code=400,
+        )
+
+    if observation_id <= 0:
+        return JSONResponse(
+            {"ok": False, "error": "invalid_observation_id"},
+            status_code=400,
+        )
+
+    stored = dict(payload)
+    stored["received_at"] = now_seconds()
+
+    with _lock:
+        _observation_results[observation_id] = stored
+        if len(_observation_results) > 100:
+            oldest = sorted(_observation_results)[:-100]
+            for old_id in oldest:
+                _observation_results.pop(old_id, None)
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "stored": True,
+            "observation_id": observation_id,
+        }
+    )
+
+
 async def state_http(request: Request) -> JSONResponse:
     if request.method == "GET":
         return await state_get_http(request)
@@ -1615,7 +1742,7 @@ auth_settings = AuthSettings(
 
 mcp = MCPServer(
     "PzADA",
-    version="0.2.7",
+    version="0.2.8",
     title="PzADA Project Zomboid Control",
     description=(
         "Read PzADA game telemetry and send validated actions to the "
@@ -1626,7 +1753,8 @@ mcp = MCPServer(
         "state; never invent item, door, container, or zombie refs. "
         "After act returns a command id, call get_result with that id and wait "
         "for completion/failure. For tests, verify success with a fresh "
-        "get_state after the result."
+        "get_state after the result. Use observe(radius) for a one-shot, "
+        "viewport-bounded visible-world summary instead of expanding nearby."
     ),
     auth=auth_settings,
     auth_server_provider=oauth_provider,
@@ -1662,6 +1790,8 @@ def health() -> dict[str, Any]:
         "received_at": received_at,
         "state_age_seconds": state_age_seconds(received_at),
         "commands_buffered": len(commands),
+        "observations_buffered": len(_observations),
+        "observation_results": len(_observation_results),
         "allowed_actions": sorted(ALLOWED_ACTIONS),
     }
 
@@ -1866,15 +1996,6 @@ def _movement_view(state: dict[str, Any]) -> dict[str, Any]:
             for vehicle in _list(nearby.get("vehicles"))
             if isinstance(vehicle, dict)
         ],
-        "water_sources": [
-            {
-                key: source.get(key)
-                for key in ("ref", "x", "y", "z", "kind", "tainted", "tainted_known")
-                if key in source
-            }
-            for source in _list(nearby.get("water_sources"))
-            if isinstance(source, dict)
-        ],
         "last_command": state.get("last_command"),
     }
 
@@ -1903,6 +2024,10 @@ def _ground_view(state: dict[str, Any]) -> dict[str, Any]:
             "z": raw.get("z"),
             "type": raw.get("type"),
             "name": raw.get("name"),
+            "kind": raw.get("kind"),
+            "object_type": raw.get("object_type"),
+            "pickup_type": raw.get("pickup_type"),
+            "sprite": raw.get("sprite"),
             "inventory_container": raw.get("inventory_container"),
             "item": _compact_item(item, "summary") if item else None,
         })
@@ -1956,16 +2081,18 @@ def get_state(section: str = "all") -> dict[str, Any]:
     Cheap views:
     - player, body_parts, world_time, crafting, inventory, last_command
     - safety: player + nearby players/zombies + last command
-    - movement: player + players/zombies + doors/windows/vehicles/water
+    - movement: player + players/zombies + doors/windows/vehicles
     - social: player + nearby players + chat
     - interactions: doors/windows/curtains/lights/appliances/fire/media/furniture
     - containers: nearby container identities/positions only, no contents
     - ground: lightweight visible ground items
-    - food, water, literature: only matching items and their locations
-    - container:<ref>: one physically-near world/ground/corpse container in detail
+    - food, water, literature: matching carried/ground items; water also includes sources
+    - container:<ref>: legacy nearby summary only; use inspect(ref) for contents
 
-    all and nearby remain available for diagnostics/backward compatibility, but
-    should not be used in the normal action loop.
+    Nearby container/corpse/vehicle/ground-bag contents are intentionally not
+    serialized continuously. Discover refs through containers/observe(radius),
+    then call inspect(ref) for one accessible target. all/nearby remain available
+    for diagnostics/backward compatibility, not the normal action loop.
     """
     state, received_at, _ = get_snapshot()
 
@@ -2067,6 +2194,127 @@ def get_state(section: str = "all") -> dict[str, Any]:
 
 
 @mcp.tool(
+    title="Observe visible Project Zomboid world",
+    annotations=READ_ONLY,
+)
+async def observe(
+    radius: float,
+    wait_seconds: float = 10.0,
+) -> dict[str, Any]:
+    """
+    Request one viewport-bounded visible-world observation from Ada's client.
+
+    radius is a direct numeric world-tile radius chosen per observation. It is
+    intersected with Ada's current viewport before Lua scans squares. The
+    result is a lightweight visible summary and does not expand container
+    contents or other hidden internals.
+    """
+    try:
+        radius = float(radius)
+        wait_seconds = float(wait_seconds)
+    except (TypeError, ValueError):
+        return {
+            "ok": False,
+            "error": "invalid_radius_or_wait",
+        }
+
+    if (
+        not math.isfinite(radius)
+        or radius <= 0
+        or radius > MAX_OBSERVATION_RADIUS
+    ):
+        return {
+            "ok": False,
+            "error": "invalid_radius",
+            "max_sanity_radius": MAX_OBSERVATION_RADIUS,
+        }
+
+    wait_seconds = max(0.0, min(wait_seconds, MAX_RESULT_WAIT_SECONDS))
+    observation = enqueue_observation(kind="observe", radius=radius)
+    observation_id = int(observation["id"])
+    deadline = time.monotonic() + wait_seconds
+
+    while True:
+        result = observation_result(observation_id)
+        if result is not None:
+            return {
+                "ok": True,
+                "found": True,
+                "observation": observation,
+                "result": result,
+            }
+
+        if time.monotonic() >= deadline:
+            return {
+                "ok": True,
+                "found": False,
+                "pending": True,
+                "observation": observation,
+            }
+
+        await asyncio.sleep(0.1)
+
+
+@mcp.tool(
+    title="Inspect one accessible Project Zomboid container",
+    annotations=READ_ONLY,
+)
+async def inspect(
+    ref: str,
+    wait_seconds: float = 10.0,
+) -> dict[str, Any]:
+    """
+    Inspect one physically accessible container/corpse/ground bag by stable ref.
+
+    This uses the separate observation request/result channel and is the
+    focused-detail replacement for continuously serializing every nearby
+    container's contents. Vehicle-part containers deliberately remain blocked
+    until their vanilla access gate is mirrored safely.
+    """
+    ref = str(ref or "").strip()
+    if not ref or len(ref) > 200:
+        return {"ok": False, "error": "invalid_ref"}
+
+    supported_prefixes = ("container_", "corpse_", "item_", "vehicle_")
+    if not ref.startswith(supported_prefixes):
+        return {
+            "ok": False,
+            "error": "unsupported_inspect_ref",
+            "supported_prefixes": list(supported_prefixes),
+        }
+
+    try:
+        wait_seconds = float(wait_seconds)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "invalid_wait"}
+
+    wait_seconds = max(0.0, min(wait_seconds, MAX_RESULT_WAIT_SECONDS))
+    observation = enqueue_observation(kind="inspect", ref=ref)
+    observation_id = int(observation["id"])
+    deadline = time.monotonic() + wait_seconds
+
+    while True:
+        result = observation_result(observation_id)
+        if result is not None:
+            return {
+                "ok": True,
+                "found": True,
+                "observation": observation,
+                "result": result,
+            }
+
+        if time.monotonic() >= deadline:
+            return {
+                "ok": True,
+                "found": False,
+                "pending": True,
+                "observation": observation,
+            }
+
+        await asyncio.sleep(0.1)
+
+
+@mcp.tool(
     title="Act in Project Zomboid",
     annotations=WRITE_ACTION,
 )
@@ -2079,7 +2327,7 @@ def act(
 
     Current actions and args:
     - ping: {}
-    - walk: {"x": int, "y": int, "z": int}
+    - walk: {"x": int, "y": int, "z": int, optional "pace": "walk" | "run"}
     - chat: {"text": "..."}
     - open_door / close_door: {"ref": "door_..."}
     - open_window / close_window: {"ref": "window_..."}
@@ -2097,7 +2345,8 @@ def act(
     - remove_bandage: {"body_part_ref": "bodypart_..."}
     - take_medicine: {"item_ref": "item_..."}
     - attack_zombie: {"target_ref": "zombie_..."}
-    - pickup_ground_item / read_item: {"item_ref": "item_..."}
+    - pickup_ground_item: {"item_ref": "item_..." | "groundcover_..."}
+    - read_item: {"item_ref": "item_..."}
     - transfer_item: {"item_ref": "item_...", "destination_ref": "inventory" | "main_inventory" | "item_..." | "container_..."}
     - cancel_action: {}
     - set_sneak: {"enabled": bool}
@@ -2397,6 +2646,11 @@ app = Starlette(
         Route("/health", health_http, methods=["GET"]),
         Route("/state", state_http, methods=["GET", "POST"]),
         Route("/command", command_http, methods=["GET", "POST"]),
+        Route(
+            "/observation-result",
+            observation_result_post_http,
+            methods=["POST"],
+        ),
         # Keep this mount LAST. Its internal Streamable HTTP endpoint is /mcp,
         # plus /authorize and /token. The explicit .well-known routes above
         # intentionally take precedence for ChatGPT discovery/validation.
