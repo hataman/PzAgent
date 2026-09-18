@@ -790,6 +790,9 @@ def enqueue_command(payload: dict[str, Any]) -> tuple[
     return command, None
 
 
+TERMINAL_COMMAND_STATUSES = {"completed", "failed", "stopped"}
+
+
 def command_result_from_state(
     state: dict[str, Any] | None,
     command_id: int,
@@ -803,6 +806,10 @@ def command_result_from_state(
         return None
 
     if str(result.get("id")) != str(command_id):
+        return None
+
+    status = str(result.get("status") or "").lower()
+    if status not in TERMINAL_COMMAND_STATUSES:
         return None
 
     return result
@@ -1479,7 +1486,7 @@ async def root_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 16,
+            "version": 17,
             "endpoints": [
                 "/health",
                 "/state",
@@ -1742,7 +1749,7 @@ auth_settings = AuthSettings(
 
 mcp = MCPServer(
     "PzADA",
-    version="0.2.9-fastloop",
+    version="0.2.10-latencyfix",
     title="PzADA Project Zomboid Control",
     description=(
         "Read PzADA game telemetry and send validated actions to the "
