@@ -75,18 +75,47 @@ MAX_RESULT_WAIT_SECONDS = 15.0
 MAX_OBSERVATION_RADIUS = 1_000_000.0
 
 ALLOWED_ACTIONS = {
-    # ContextMenu-first discrete interaction path.
-    "context_action",
-    # Generic runtime key-binding event path (tap/hold).
-    "input_binding",
-    # Real-time / non-ContextMenu primitives retained for live play.
     "ping",
     "walk",
     "chat",
+    "open_door",
+    "close_door",
+    "open_window",
+    "close_window",
+    "loot_item",
+    "equip",
+    "wear",
+    "unwear",
+    "drop_item",
+    "eat",
+    "drink_item",
+    "drink_source",
+    "fill_water",
+    "sit_ground",
+    "stand_up",
+    "rest",
+    "get_on_bed",
+    "bed_pose",
+    "sleep",
+    "wake_up",
+    "bandage",
+    "remove_bandage",
+    "disinfect",
+    "take_medicine",
     "attack_zombie",
+    "pickup_ground_item",
+    "transfer_item",
     "cancel_action",
     "set_sneak",
-    "wake_up",
+    "climb_window",
+    "set_curtain",
+    "set_light",
+    "read_item",
+    "set_media_device",
+    "control_media",
+    "set_appliance",
+    "control_fire_source",
+    "craft_recipe",
 }
 
 _lock = threading.Lock()
@@ -302,11 +331,6 @@ def enqueue_observation(
     kind: str,
     radius: float | None = None,
     ref: str | None = None,
-    x: int | None = None,
-    y: int | None = None,
-    z: int | None = None,
-    item_ref: str | None = None,
-    source_ref: str | None = None,
 ) -> dict[str, Any]:
     global _last_observation_id
 
@@ -325,16 +349,6 @@ def enqueue_observation(
             observation["radius"] = float(radius)
         if ref is not None:
             observation["ref"] = ref
-        if x is not None:
-            observation["x"] = int(x)
-        if y is not None:
-            observation["y"] = int(y)
-        if z is not None:
-            observation["z"] = int(z)
-        if item_ref is not None:
-            observation["item_ref"] = str(item_ref)
-        if source_ref is not None:
-            observation["source_ref"] = str(source_ref)
 
         _observations.append(observation)
         if len(_observations) > 100:
@@ -923,57 +937,6 @@ def build_command(payload: dict[str, Any]) -> tuple[
             }
 
         command["recipe_ref"] = recipe_ref
-
-    if action == "input_binding":
-        binding = payload.get("binding")
-        mode = str(payload.get("mode") or "tap").strip().lower()
-        if not isinstance(binding, str) or not binding.strip() or len(binding) > 128:
-            return None, {
-                "status": 400,
-                "error": "input_binding_requires_binding_name",
-            }
-        if mode not in {"tap", "hold", "release"}:
-            return None, {
-                "status": 400,
-                "error": "input_binding_mode_invalid",
-                "allowed": ["tap", "hold", "release"],
-            }
-        command["binding"] = binding.strip()
-        command["mode"] = mode
-        if mode == "hold":
-            try:
-                hold_ms = int(payload.get("hold_ms", 550))
-            except (TypeError, ValueError):
-                return None, {
-                    "status": 400,
-                    "error": "input_binding_hold_ms_invalid",
-                }
-            if hold_ms < 500 or hold_ms > 2000:
-                return None, {
-                    "status": 400,
-                    "error": "input_binding_hold_ms_out_of_range",
-                    "min": 500,
-                    "max": 2000,
-                }
-            command["hold_ms"] = hold_ms
-
-    if action == "context_action":
-        context_id = payload.get("context_id")
-        action_id = payload.get("action_id")
-        if (
-            not isinstance(context_id, str)
-            or not context_id.startswith("ctx_")
-            or len(context_id) > 100
-            or not isinstance(action_id, str)
-            or not action_id.startswith("a")
-            or len(action_id) > 32
-        ):
-            return None, {
-                "status": 400,
-                "error": "context_action_requires_context_id_and_action_id",
-            }
-        command["context_id"] = context_id
-        command["action_id"] = action_id
 
     return command, None
 
@@ -1693,7 +1656,7 @@ async def root_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 19,
+            "version": 18,
             "endpoints": [
                 "/health",
                 "/state",
@@ -1757,7 +1720,7 @@ async def health_http(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "PzADA relay + MCP",
-            "version": 19,
+            "version": 18,
             "has_state": state is not None,
             "received_at": received_at,
             "state_age_seconds": state_age_seconds(received_at),
@@ -2008,14 +1971,14 @@ auth_settings = AuthSettings(
 
 mcp = MCPServer(
     "PzADA",
-    version="0.3.0-contextmenu",
+    version="0.2.11-twitch",
     title="PzADA Project Zomboid Control",
     description=(
         "Read PzADA game telemetry and send validated actions to the "
         "Project Zomboid Ada character."
     ),
     instructions=(
-        "For discrete world interactions prefer get_actions(x,y,z), for known items use get_item_actions(item_ref, source_ref), for visible standard modal/window controls use get_ui_actions(), and for a visible player radial use get_radial_actions(); execute only an enabled action_id from the returned context. For keyboard-driven game controls, inspect get_key_bindings() and use press_key_binding() rather than hardcoding physical keys. For real-time primitives prefer step(action, args, state_section) so one "
+        "For routine live play, prefer step(action, args, state_section) so one "
         "tool call queues the action, waits briefly for its result, and returns "
         "a compact fresh state. Do not call get_state before and after every "
         "routine action when step already returned usable state. Use refs exactly "
@@ -2415,7 +2378,7 @@ def get_state(section: str = "safety") -> dict[str, Any]:
     Routine decisions should use the smallest useful view instead of all/nearby.
 
     Cheap views:
-    - player, moodles, body_parts, world_time, lighting, weather, crafting, inventory, last_command
+    - player, body_parts, world_time, crafting, inventory, last_command
     - safety: player + nearby players/zombies + last command
     - movement: player + players/zombies + doors/windows/vehicles
     - social: player + nearby players + chat
@@ -2448,18 +2411,12 @@ def get_state(section: str = "safety") -> dict[str, Any]:
         data = state.get("player")
     elif section_key == "inventory":
         data = state.get("inventory")
-    elif section_key == "moodles":
-        data = state.get("moodles")
     elif section_key == "body_parts":
         data = state.get("body_parts")
     elif section_key == "nearby":
         data = state.get("nearby")
     elif section_key == "world_time":
         data = state.get("world_time")
-    elif section_key == "lighting":
-        data = state.get("lighting")
-    elif section_key == "weather":
-        data = state.get("weather")
     elif section_key == "crafting":
         data = state.get("crafting")
     elif section_key == "last_command":
@@ -2499,12 +2456,9 @@ def get_state(section: str = "safety") -> dict[str, Any]:
                 "all",
                 "player",
                 "inventory",
-                "moodles",
                 "body_parts",
                 "nearby",
                 "world_time",
-                "lighting",
-                "weather",
                 "crafting",
                 "last_command",
                 "safety",
@@ -2660,268 +2614,6 @@ async def inspect(
 
 
 @mcp.tool(
-    title="Get Project Zomboid key bindings",
-    annotations=READ_ONLY,
-)
-async def get_key_bindings(
-    wait_seconds: float = 10.0,
-) -> dict[str, Any]:
-    """
-    Enumerate the game's current runtime key bindings without hardcoding keys.
-
-    Bindings come from the shared keyBinding table plus Core's current mapping,
-    so changed user bindings are reflected. event_supported=false means the
-    generic input path cannot safely reproduce that binding (for example a
-    modifier-required or unbound control).
-    """
-    try:
-        wait_seconds = float(wait_seconds)
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "invalid_wait"}
-    wait_seconds = max(0.0, min(wait_seconds, MAX_RESULT_WAIT_SECONDS))
-    observation = enqueue_observation(kind="get_key_bindings")
-    observation_id = int(observation["id"])
-    deadline = time.monotonic() + wait_seconds
-    while True:
-        result = observation_result(observation_id)
-        if result is not None:
-            return {"ok": True, "found": True, "observation": observation, "result": result}
-        if time.monotonic() >= deadline:
-            return {"ok": True, "found": False, "pending": True, "observation": observation}
-        await asyncio.sleep(0.1)
-
-
-@mcp.tool(
-    title="Press a Project Zomboid key binding",
-    annotations=WRITE_ACTION,
-)
-async def press_key_binding(
-    binding: str,
-    mode: str = "tap",
-    hold_ms: int = 550,
-    wait_seconds: float = 3.0,
-) -> dict[str, Any]:
-    """
-    Dispatch one runtime key binding without hardcoding its physical key.
-
-    mode=tap queues a normal Project Zomboid keyboard tap. mode=hold starts and
-    keeps the Lua long-press sequence active; after the tool returns the binding
-    remains held so a radial menu can be inspected/executed. mode=release ends
-    a matching active hold. Executing a discovered radial action also releases
-    the active hold automatically before invoking the slice callback.
-
-    Modifier-bound keys are rejected until modifier state can be reproduced
-    safely. hold_ms is the minimum long-press time before mode=hold completes,
-    not an automatic release timer; the client has a 10-second safety release.
-    """
-    binding = str(binding or "").strip()
-    mode = str(mode or "tap").strip().lower()
-    try:
-        hold_ms = int(hold_ms)
-        wait_seconds = float(wait_seconds)
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "invalid_input_arguments"}
-    wait_seconds = max(0.0, min(wait_seconds, MAX_RESULT_WAIT_SECONDS))
-    payload: dict[str, Any] = {"action": "input_binding", "binding": binding, "mode": mode}
-    if mode == "hold":
-        payload["hold_ms"] = hold_ms
-    command, error = enqueue_command(payload)
-    if error:
-        return {"ok": False, **{k: v for k, v in error.items() if k != "status"}}
-    assert command is not None
-    command_id = int(command["id"])
-    deadline = time.monotonic() + wait_seconds
-    while True:
-        state, received_at, _ = get_snapshot()
-        result = command_result_from_state(state, command_id)
-        if result is not None and result.get("status") not in {"queued", "running"}:
-            return {
-                "ok": True,
-                "accepted": True,
-                "command": command,
-                "result": result,
-                "received_at": received_at,
-                "state_age_seconds": state_age_seconds(received_at),
-            }
-        if time.monotonic() >= deadline:
-            return {"ok": True, "accepted": True, "pending": True, "command": command, "result": result}
-        await asyncio.sleep(0.1)
-
-
-@mcp.tool(
-    title="Get visible Project Zomboid radial actions",
-    annotations=READ_ONLY,
-)
-async def get_radial_actions(
-    wait_seconds: float = 10.0,
-) -> dict[str, Any]:
-    """
-    Enumerate slices from the currently visible player ISRadialMenu.
-
-    This is generic across radial menus that use the standard player radial
-    surface. Selecting a submenu slice may populate another radial; call this
-    tool again after execution to discover the new slices.
-    """
-    try:
-        wait_seconds = float(wait_seconds)
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "invalid_wait"}
-    wait_seconds = max(0.0, min(wait_seconds, MAX_RESULT_WAIT_SECONDS))
-    observation = enqueue_observation(kind="get_radial_actions")
-    observation_id = int(observation["id"])
-    deadline = time.monotonic() + wait_seconds
-    while True:
-        result = observation_result(observation_id)
-        if result is not None:
-            return {"ok": True, "found": True, "observation": observation, "result": result}
-        if time.monotonic() >= deadline:
-            return {"ok": True, "found": False, "pending": True, "observation": observation}
-        await asyncio.sleep(0.1)
-
-
-@mcp.tool(
-    title="Get current Project Zomboid UI actions",
-    annotations=READ_ONLY,
-)
-async def get_ui_actions(
-    wait_seconds: float = 10.0,
-) -> dict[str, Any]:
-    """
-    Enumerate currently visible standard Project Zomboid UI buttons.
-
-    This is a generic semantic UI surface for modal/window confirmation and
-    other standard ISButton controls. It does not synthesize mouse clicks or
-    contain screen/mod-specific rules. Returned actions use the same short-lived
-    context_id + action_id execution path as world/item ContextMenus.
-    """
-    try:
-        wait_seconds = float(wait_seconds)
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "invalid_wait"}
-
-    wait_seconds = max(0.0, min(wait_seconds, MAX_RESULT_WAIT_SECONDS))
-    observation = enqueue_observation(kind="get_ui_actions")
-    observation_id = int(observation["id"])
-    deadline = time.monotonic() + wait_seconds
-    while True:
-        result = observation_result(observation_id)
-        if result is not None:
-            return {
-                "ok": True, "found": True,
-                "observation": observation, "result": result,
-            }
-        if time.monotonic() >= deadline:
-            return {
-                "ok": True, "found": False, "pending": True,
-                "observation": observation,
-            }
-        await asyncio.sleep(0.1)
-
-
-@mcp.tool(
-    title="Get Project Zomboid item context actions",
-    annotations=READ_ONLY,
-)
-async def get_item_actions(
-    item_ref: str,
-    source_ref: str | None = None,
-    wait_seconds: float = 10.0,
-) -> dict[str, Any]:
-    """
-    Synthesize the real inventory ContextMenu for one known item.
-
-    Carried and visible ground items need only item_ref. For an item discovered
-    by inspect(ref), pass that inspected container/corpse/ground-bag ref as
-    source_ref. Disabled/red options are returned with enabled=false. No item
-    action names are hardcoded; vanilla/mod callbacks are discovered and later
-    revalidated by execute_action().
-    """
-    item_ref = str(item_ref or "").strip()
-    source_ref = str(source_ref or "").strip() or None
-    if not item_ref.startswith("item_") or len(item_ref) > 200:
-        return {"ok": False, "error": "invalid_item_ref"}
-    if source_ref is not None:
-        allowed = ("container_", "corpse_", "item_")
-        if not source_ref.startswith(allowed) or len(source_ref) > 200:
-            return {"ok": False, "error": "invalid_source_ref"}
-    try:
-        wait_seconds = float(wait_seconds)
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "invalid_wait"}
-
-    wait_seconds = max(0.0, min(wait_seconds, MAX_RESULT_WAIT_SECONDS))
-    observation = enqueue_observation(
-        kind="get_item_actions", item_ref=item_ref, source_ref=source_ref
-    )
-    observation_id = int(observation["id"])
-    deadline = time.monotonic() + wait_seconds
-    while True:
-        result = observation_result(observation_id)
-        if result is not None:
-            return {
-                "ok": True, "found": True,
-                "observation": observation, "result": result,
-            }
-        if time.monotonic() >= deadline:
-            return {
-                "ok": True, "found": False, "pending": True,
-                "observation": observation,
-            }
-        await asyncio.sleep(0.1)
-
-
-@mcp.tool(
-    title="Get current Project Zomboid context actions",
-    annotations=READ_ONLY,
-)
-async def get_actions(
-    x: int,
-    y: int,
-    z: int,
-    wait_seconds: float = 10.0,
-) -> dict[str, Any]:
-    """
-    Ask the game to synthesize the real world ContextMenu for one loaded tile.
-
-    Returns an opaque context_id and the current leaf actions. Each row includes
-    enabled state; disabled/red options are returned for capability awareness but
-    must not be executed. Choose only an enabled action_id from this exact call.
-    Labels are display text, not server-side behavior rules. The context expires
-    quickly and is re-created/revalidated before any callback is invoked.
-    """
-    try:
-        x = int(x)
-        y = int(y)
-        z = int(z)
-        wait_seconds = float(wait_seconds)
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "invalid_target_coordinates_or_wait"}
-
-    wait_seconds = max(0.0, min(wait_seconds, MAX_RESULT_WAIT_SECONDS))
-    observation = enqueue_observation(kind="get_actions", x=x, y=y, z=z)
-    observation_id = int(observation["id"])
-    deadline = time.monotonic() + wait_seconds
-
-    while True:
-        result = observation_result(observation_id)
-        if result is not None:
-            return {
-                "ok": True,
-                "found": True,
-                "observation": observation,
-                "result": result,
-            }
-        if time.monotonic() >= deadline:
-            return {
-                "ok": True,
-                "found": False,
-                "pending": True,
-                "observation": observation,
-            }
-        await asyncio.sleep(0.1)
-
-
-@mcp.tool(
     title="Act in Project Zomboid",
     annotations=WRITE_ACTION,
 )
@@ -2930,12 +2622,45 @@ def act(
     args: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
-    Queue one low-level primitive action.
+    Queue one validated PzADA action.
 
-    Discrete world interactions should use get_actions() -> execute_action().
-    Retained primitives are: ping, walk, chat, attack_zombie, cancel_action,
-    set_sneak, wake_up. This tool remains mainly for compatibility/debug; use
-    step() for primitive live-play actions when you want result + fresh state.
+    Current actions and args:
+    - ping: {}
+    - walk: {"x": int, "y": int, "z": int, optional "pace": "walk" | "run"}
+    - chat: {"text": "..."}
+    - open_door / close_door: {"ref": "door_..."}
+    - open_window / close_window: {"ref": "window_..."}
+    - loot_item: {"container_ref": "container_...", "item_ref": "item_..."}
+    - equip / wear / unwear / drop_item: {"item_ref": "item_..."}
+    - eat / drink_item: {"item_ref": "item_...", "percentage": 0..1}
+    - drink_source: {"source_ref": "water_..."}
+    - fill_water: {"item_ref": "item_...", "source_ref": "water_..."}
+    - sit_ground / stand_up: {}
+    - rest / get_on_bed: {"furniture_ref": "furniture_..."}
+    - bed_pose: {"pose": "awake" | "asleep"}
+    - sleep: {} or {"furniture_ref": "furniture_..."}
+    - wake_up: {}
+    - bandage / disinfect: {"item_ref": "item_...", "body_part_ref": "bodypart_..."}
+    - remove_bandage: {"body_part_ref": "bodypart_..."}
+    - take_medicine: {"item_ref": "item_..."}
+    - attack_zombie: {"target_ref": "zombie_..."}
+    - pickup_ground_item: {"item_ref": "item_..." | "groundcover_..."}
+    - read_item: {"item_ref": "item_..."}
+    - transfer_item: {"item_ref": "item_...", "destination_ref": "inventory" | "main_inventory" | "item_..." | "container_..."}
+    - cancel_action: {}
+    - set_sneak: {"enabled": bool}
+    - climb_window: {"ref": "window_..."}
+    - set_curtain: {"ref": "curtain_...", "open": bool}
+    - set_light: {"ref": "light_...", "on": bool}
+    - set_media_device: {"device_ref": "media_...", optional "power": bool, "channel": int, "volume": 0..1}
+    - control_media: {"device_ref": "media_...", "operation": "insert" | "eject" | "play" | "stop", optional "item_ref": "item_..."}
+    - set_appliance: {"appliance_ref": "appliance_...", "on": bool}
+    - control_fire_source: {"fire_ref": "fire_...", "operation": "light" | "add_fuel" | "extinguish", optional "item_ref": "item_...", "purpose": "..."}
+    - craft_recipe: {"recipe_ref": "craft_..."}
+
+    Legacy/debug action enqueue. Routine live play should use step(), which
+    returns the action result and compact fresh state in one tool call. Use only
+    refs that telemetry returned.
     """
     payload: dict[str, Any] = {"action": action}
 
@@ -2959,116 +2684,6 @@ def act(
         "next": "Legacy path: call get_result. Routine live play should use step().",
     }
 
-
-
-
-@mcp.tool(
-    title="Execute one discovered Project Zomboid context action",
-    annotations=WRITE_ACTION,
-)
-async def execute_action(
-    context_id: str,
-    action_id: str,
-    wait_seconds: float = 3.0,
-    twitch_after: int | None = None,
-) -> dict[str, Any]:
-    """
-    Execute exactly one action returned by get_actions(), get_item_actions(),
-    get_ui_actions(), or get_radial_actions().
-
-    The game re-creates the ContextMenu for the original tile and verifies the
-    same option path, label and callback signature before invoking it. There is
-    no fallback to another action. A completed command means the revalidated
-    callback was invoked without a Lua error; timed gameplay completion can
-    still require a later observation/state check.
-
-    During Twitch live play, pass the last handled Twitch event id as
-    twitch_after to piggyback new viewer events on this response.
-    """
-    try:
-        wait_seconds = float(wait_seconds)
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "invalid_wait"}
-    wait_seconds = max(0.0, min(wait_seconds, MAX_RESULT_WAIT_SECONDS))
-
-    if twitch_after is not None:
-        try:
-            twitch_after = int(twitch_after)
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "invalid_twitch_cursor"}
-
-    command, error = enqueue_command({
-        "action": "context_action",
-        "context_id": context_id,
-        "action_id": action_id,
-    })
-    if error:
-        return {
-            "ok": False,
-            **{k: v for k, v in error.items() if k != "status"},
-        }
-
-    assert command is not None
-    command_id = int(command["id"])
-    started = time.monotonic()
-    deadline = started + wait_seconds
-
-    while True:
-        state, received_at, commands = get_snapshot()
-        result = command_result_from_state(state, command_id)
-        nearby = _nearby(state or {})
-        state_view = {
-            "ok": True,
-            "received_at": received_at,
-            "state_age_seconds": state_age_seconds(received_at),
-            "section": "safety",
-            "data": {
-                "player": (state or {}).get("player"),
-                "players": _list(nearby.get("players")),
-                "zombies": _list(nearby.get("zombies")),
-                "last_command": (state or {}).get("last_command"),
-            },
-        }
-
-        if result is not None:
-            return _attach_twitch_events(
-                {
-                    "ok": True,
-                    "accepted": True,
-                    "found": True,
-                    "command": command,
-                    "result": result,
-                    "state": state_view,
-                    "timing": {
-                        "server_wait_seconds": round(time.monotonic() - started, 3),
-                        "state_age_seconds": state_age_seconds(received_at),
-                    },
-                },
-                twitch_after,
-            )
-
-        if time.monotonic() >= deadline:
-            queued = next(
-                (item for item in reversed(commands) if int(item["id"]) == command_id),
-                None,
-            )
-            return _attach_twitch_events(
-                {
-                    "ok": True,
-                    "accepted": True,
-                    "found": False,
-                    "pending": queued is not None,
-                    "command": command,
-                    "state": state_view,
-                    "timing": {
-                        "server_wait_seconds": round(time.monotonic() - started, 3),
-                        "state_age_seconds": state_age_seconds(received_at),
-                    },
-                },
-                twitch_after,
-            )
-
-        await asyncio.sleep(0.1)
 
 
 def _attach_twitch_events(
@@ -3102,9 +2717,9 @@ async def step(
     twitch_after: int | None = None,
 ) -> dict[str, Any]:
     """
-    Queue one low-level primitive action, wait briefly for its Lua result, then
-    return a compact fresh telemetry view in the same tool call. For discrete
-    world interactions use get_actions() -> execute_action() instead.
+    Queue one action, wait briefly for its Lua result, then return a compact
+    fresh telemetry view in the same tool call. This is the preferred live-play
+    path because it avoids act -> get_result -> get_state round trips.
 
     state_section is intentionally limited to safety or movement so the fast
     path cannot accidentally return a large diagnostic payload. Use get_state
