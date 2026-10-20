@@ -75,11 +75,11 @@ MAX_RESULT_WAIT_SECONDS = 15.0
 MAX_OBSERVATION_RADIUS = 1_000_000.0
 
 ALLOWED_ACTIONS = {
-    # ContextMenu-first discrete interaction path.
+    # ContextMenu remains the generic/default interaction path.
     "context_action",
-    # Generic runtime key-binding event path (tap/hold).
     "input_binding",
-    # Real-time / non-ContextMenu primitives retained for live play.
+
+    # Existing validated fast-path handlers.
     "ping",
     "walk",
     "chat",
@@ -87,6 +87,40 @@ ALLOWED_ACTIONS = {
     "cancel_action",
     "set_sneak",
     "wake_up",
+    "open_door",
+    "close_door",
+    "open_window",
+    "close_window",
+    "climb_window",
+    "set_curtain",
+    "set_light",
+    "set_appliance",
+    "loot_item",
+    "pickup_ground_item",
+    "transfer_item",
+    "equip",
+    "wear",
+    "unwear",
+    "drop_item",
+    "eat",
+    "drink_item",
+    "drink_source",
+    "fill_water",
+    "take_medicine",
+    "bandage",
+    "disinfect",
+    "remove_bandage",
+    "read_item",
+    "rest",
+    "get_on_bed",
+    "bed_pose",
+    "sleep",
+    "sit_ground",
+    "stand_up",
+    "set_media_device",
+    "control_media",
+    "control_fire_source",
+    "craft_recipe",
 }
 
 _lock = threading.Lock()
@@ -2015,8 +2049,7 @@ mcp = MCPServer(
         "Project Zomboid Ada character."
     ),
     instructions=(
-        "For discrete world interactions prefer get_actions(x,y,z), for known items use get_item_actions(item_ref, source_ref), for visible standard modal/window controls use get_ui_actions(), and for a visible player radial use get_radial_actions(); execute only an enabled action_id from the returned context. For keyboard-driven game controls, inspect get_key_bindings() and use press_key_binding() rather than hardcoding physical keys. For real-time primitives prefer step(action, args, state_section) so one "
-        "tool call queues the action, waits briefly for its result, and returns "
+        "For discrete world interactions prefer get_actions(x,y,z), for known items use get_item_actions(item_ref, source_ref), and execute only an enabled action_id from the returned context. When a target/ref is already known and latency matters, step(action, args, state_section) may use the existing validated fast-path handlers such as walk (pace=walk/run), inventory, equipment, medical, door/window, furniture, media, fire, and crafting actions. For keyboard-driven local-player controls, inspect get_key_bindings() and use press_key_binding() rather than hardcoding physical keys. step() queues the action, waits briefly for its result, and returns "
         "a compact fresh state. Do not call get_state before and after every "
         "routine action when step already returned usable state. Use refs exactly "
         "as returned by telemetry; never invent item, door, container, or zombie "
@@ -2930,12 +2963,11 @@ def act(
     args: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
-    Queue one low-level primitive action.
+    Queue one validated direct action.
 
-    Discrete world interactions should use get_actions() -> execute_action().
-    Retained primitives are: ping, walk, chat, attack_zombie, cancel_action,
-    set_sneak, wake_up. This tool remains mainly for compatibility/debug; use
-    step() for primitive live-play actions when you want result + fresh state.
+    Generic discrete interactions should use get_actions() -> execute_action().
+    Use this direct path when the exact target/ref and handler are already known.
+    For normal live play, step() is preferred because it also returns fresh state.
     """
     payload: dict[str, Any] = {"action": action}
 
@@ -3102,9 +3134,10 @@ async def step(
     twitch_after: int | None = None,
 ) -> dict[str, Any]:
     """
-    Queue one low-level primitive action, wait briefly for its Lua result, then
-    return a compact fresh telemetry view in the same tool call. For discrete
-    world interactions use get_actions() -> execute_action() instead.
+    Queue one validated fast-path action, wait briefly for its Lua result, then
+    return a compact fresh telemetry view in the same tool call. Generic/discovered
+    world interactions still use get_actions() -> execute_action(); use step when
+    the exact action and target/ref are already known.
 
     state_section is intentionally limited to safety or movement so the fast
     path cannot accidentally return a large diagnostic payload. Use get_state
